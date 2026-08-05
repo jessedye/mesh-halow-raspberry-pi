@@ -1,0 +1,15 @@
+[Unit]
+Description=HaLow station join/leave event recorder
+After=halow-ap.service
+BindsTo=halow-ap.service
+
+[Service]
+Type=simple
+User=halow-ui
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 15); do [ -S /var/run/hostapd_s1g/halow0 ] && exit 0; sleep 2; done; exit 1'
+ExecStart=/usr/local/bin/hostapd_cli_s1g -p /var/run/hostapd_s1g -i halow0 -a /usr/local/bin/halow-sta-events
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=halow-ap.service

@@ -79,6 +79,7 @@ rsn_pairwise=CCMP
 ieee80211w=2
 sae_password=${HALOW_PASSPHRASE}
 ctrl_interface=/var/run/hostapd_s1g
+ctrl_interface_group=halow-ui
 EOF
   echo "generated $CONF: ${HALOW_SSID} ch=$CH op_class=$OP width=${WIDTH}MHz"
 }

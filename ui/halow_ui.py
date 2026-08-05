@@ -421,6 +421,84 @@ def api_system_reboot():
     return jsonify({"ok": True, "output": "rebooting"})
 
 
+# ---------- Measurement, events, logs ----------
+
+THROUGHPUT_LOG = "/var/lib/halow/throughput.jsonl"
+EVENTS_LOG = "/var/lib/halow/station-events.log"
+LOG_UNITS = ("halow-ap", "halow-net", "halow-ui", "halow-sta-events",
+             "halow-iperf3", "dnsmasq", "kernel")
+
+
+@app.post("/api/halow/throughput")
+@authed
+def api_halow_throughput():
+    target = request.form.get("target", "")
+    import re as _re
+    if not _re.match(r"^[0-9.]+$", target):
+        return jsonify({"error": "target must be an IPv4 address"}), 400
+    secs = min(int(request.form.get("seconds", "5")), 30)
+    rev = ["-R"] if request.form.get("reverse") == "1" else []
+    try:
+        r = subprocess.run(["iperf3", "-c", target, "-t", str(secs), "-J"]
+                           + rev, capture_output=True, text=True,
+                           timeout=secs + 15)
+        data = json.loads(r.stdout)
+        if "error" in data:
+            return jsonify({"error": data["error"]}), 502
+        end = data["end"]["sum_received" if not rev else "sum_sent"]
+        result = {
+            "target": target, "seconds": secs,
+            "reverse": bool(rev),
+            "mbps": round(end["bits_per_second"] / 1e6, 2),
+            "bytes": end["bytes"],
+            "retransmits": data["end"].get("sum_sent", {}).get("retransmits"),
+            "at": subprocess.run(["date", "-Is"], capture_output=True,
+                                 text=True).stdout.strip(),
+        }
+        with open(THROUGHPUT_LOG, "a") as f:
+            f.write(json.dumps(result) + "\n")
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.get("/api/halow/throughput")
+@authed
+def api_halow_throughput_history():
+    out = []
+    try:
+        with open(THROUGHPUT_LOG) as f:
+            out = [json.loads(x) for x in f.readlines()[-50:]]
+    except OSError:
+        pass
+    return jsonify({"runs": out})
+
+
+@app.get("/api/halow/events")
+@authed
+def api_halow_events():
+    lines = []
+    try:
+        with open(EVENTS_LOG) as f:
+            lines = [x.strip() for x in f.readlines()[-100:]]
+    except OSError:
+        pass
+    return jsonify({"events": lines})
+
+
+@app.get("/api/logs")
+@authed
+def api_logs():
+    unit = request.args.get("unit", "halow-ap")
+    if unit not in LOG_UNITS:
+        return jsonify({"error": f"unit must be one of {LOG_UNITS}"}), 400
+    n = min(int(request.args.get("n", "150")), 1000)
+    cmd = (["journalctl", "-k"] if unit == "kernel"
+           else ["journalctl", "-u", unit])
+    out = sh(" ".join(cmd + ["-n", str(n), "--no-pager", "-q"]), timeout=15)
+    return jsonify({"unit": unit, "lines": out.splitlines()})
+
+
 # ---------- Mesh nodes ----------
 
 def node_get(node, path):
@@ -569,7 +647,7 @@ border-radius:6px;padding:5px 8px;font:inherit;width:110px}
 <a href="/logout" style="color:var(--dim);margin-left:14px;text-decoration:none">logout</a></header>
 <main id="main"></main>
 <script>
-const TABS=["Overview","HaLow","Router","Config","Nodes"];let tab="Overview";
+const TABS=["Overview","HaLow","Router","Config","Nodes","Debug"];let tab="Overview";
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 async function j(u,opt){const r=await fetch(u,opt);if(!r.ok)throw new Error(r.status);return r.json()}
@@ -580,7 +658,33 @@ async function render(){nav();const m=$("#main");m.innerHTML="<p class='warn'>lo
  else if(tab==="HaLow")m.innerHTML=await halow();
  else if(tab==="Router")m.innerHTML=await router();
  else if(tab==="Config")m.innerHTML=await config();
+ else if(tab==="Debug")m.innerHTML=await debug();
  else m.innerHTML=await nodes();}catch(e){m.innerHTML=`<p class="bad">${esc(e)}</p>`}}
+async function debug(){const ev=await j("/api/halow/events"),tp=await j("/api/halow/throughput");
+ const runs=tp.runs.length?tp.runs.slice(-10).reverse().map(r=>
+  `<tr><td>${esc(r.at)}</td><td>${esc(r.target)}</td><td>${r.reverse?"AP→STA":"STA→AP"}</td><td>${r.mbps} Mbps</td></tr>`).join("")
+  :`<tr><td colspan=4 class="warn">no runs recorded</td></tr>`;
+ return `<div class="card"><h2>throughput test (iperf3)</h2>
+ <p>target IP <input id="t-ip" placeholder="10.117.0.50">
+ seconds <input id="t-sec" value="5" style="width:50px">
+ <label><input type="checkbox" id="t-rev" style="width:auto"> AP→STA (reverse)</label>
+ <button class="act" onclick="tpRun(this)">run</button></p>
+ <table><tr><th>when</th><th>target</th><th>direction</th><th>rate</th></tr>${runs}</table>
+ <p style="color:var(--dim)">The gateway also runs an iperf3 server — any HaLow client can test against 10.117.0.1.</p></div>
+ <div class="card"><h2>station events</h2>
+ <pre>${esc(ev.events.slice(-25).join("\n")||"none recorded")}</pre></div>
+ <div class="card"><h2>service logs</h2>
+ <p><select id="l-unit">${["halow-ap","halow-net","halow-ui","halow-sta-events","halow-iperf3","dnsmasq","kernel"].map(u=>`<option>${u}</option>`).join("")}</select>
+ <button class="act" onclick="logsLoad()">load</button></p>
+ <pre id="l-out" style="max-height:400px"></pre></div>`}
+async function tpRun(btn){btn.disabled=true;btn.textContent="running…";
+ try{const fd=new FormData();fd.append("target",$("#t-ip").value);
+ fd.append("seconds",$("#t-sec").value);if($("#t-rev").checked)fd.append("reverse","1");
+ const d=await(await fetch("/api/halow/throughput",{method:"POST",body:fd})).json();
+ alert(d.error||`${d.mbps} Mbps`);render()}finally{btn.disabled=false;btn.textContent="run"}}
+async function logsLoad(){const u=$("#l-unit").value;
+ const d=await j(`/api/logs?unit=${u}&n=200`);
+ $("#l-out").textContent=d.lines.join("\n")||"(empty)"}
 async function config(){const c=await j("/api/config");
  const fwds=c.forwards.length?c.forwards.map(f=>
   `<tr><td>${esc(f.proto)}</td><td>${f.ext}</td><td>${esc(f.dest)}</td>

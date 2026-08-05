@@ -1,0 +1,14 @@
+[Unit]
+Description=iperf3 server for HaLow link measurement
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/iperf3 -s
+Restart=on-failure
+RestartSec=5
+User=halow-ui
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

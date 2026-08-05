@@ -1,0 +1,7 @@
+#!/bin/bash
+# hostapd_cli action script: called as <iface> <event> [mac ...].
+# Records station lifecycle with timestamps — the join history the UI,
+# the API, and the eventual ladder metric all read.
+LOG=/var/lib/halow/station-events.log
+printf '%s %s %s\n' "$(date -Is)" "$2" "${3:-}" >> "$LOG"
+logger -t halow-sta "$2 ${3:-}"

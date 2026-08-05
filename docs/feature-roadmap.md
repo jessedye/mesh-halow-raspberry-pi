@@ -19,7 +19,7 @@ UI/API, recovery — but the clients set a higher bar in three areas:
 
 ## Needed features (functional gaps for the mesh)
 
-1. **Measured link numbers** — every profile speed is a vendor claim `[C]`.
+1. **Measured link numbers** — MACHINERY DONE 2026-08-05 (iperf3 server unit + POST /api/halow/throughput + jsonl history + Debug tab; loopback-verified). Real `[M]` numbers await the first station. — every profile speed is a vendor claim `[C]`.
    Run iperf3 on the gateway (`iperf3 -s` as a unit) + an API/UI harness
    to test against associated stations and record results
    (`results/halow-throughput-*.json`, mesh-v4 `baseline.py` culture:
@@ -30,7 +30,7 @@ UI/API, recovery — but the clients set a higher bar in three areas:
    (transport-ladder doc). Expose `GET /api/halow/link/<mac>`: current
    rate, RSSI, retry/fail counters, and a short history — shaped so a
    node or the operator can derive the rung cost without guessing.
-3. **Station lifecycle events** — hostapd_cli hook logging
+3. **Station lifecycle events** — DONE 2026-08-05 (hostapd_cli hook → /var/lib/halow/station-events.log, GET /api/halow/events, Debug tab; ctrl socket group-granted). — hostapd_cli hook logging
    AP-STA-CONNECTED/DISCONNECTED with timestamps; `GET /api/halow/events`;
    UI surfaces joins/leaves. The first real node join should
    self-document the way first contact did.
@@ -40,7 +40,7 @@ UI/API, recovery — but the clients set a higher bar in three areas:
    brownout history and the module TX-bursts on the 3V3 rail), station
    count, per-service restart counts. Read the low-water mark, not the
    current value.
-5. **Logs API + Debug tab** — `GET /api/logs?unit=halow-ap&n=200`
+5. **Logs API + Debug tab** — DONE 2026-08-05 (GET /api/logs?unit=..., whitelisted units incl. kernel). — `GET /api/logs?unit=halow-ap&n=200`
    wrapping journalctl, so remote debugging doesn't need SSH. The nodes
    had this from day one.
 6. **Kernel/module mismatch guard (A6)** — boot-time check comparing
