@@ -8,6 +8,7 @@ router layer via ip/nft/dnsmasq, and the mesh nodes' own admin APIs via
 the bearer token in /etc/halow/nodes.json (never committed).
 """
 import base64
+import datetime
 import hashlib
 import hmac
 import json
@@ -15,10 +16,11 @@ import os
 import shutil
 import ssl
 import subprocess
+import time
 import urllib.request
 from functools import wraps
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, redirect, request, session
 
 CONF_DIR = "/etc/halow"
 UI_CONF = os.path.join(CONF_DIR, "ui.conf")          # AUTH_SALT/AUTH_HASH/ITER
@@ -28,6 +30,31 @@ PROFILES = os.path.join(CONF_DIR, "halow-profiles.json")
 HALOW_IF = "halow0"
 
 app = Flask(__name__)
+
+
+def _session_secret():
+    """Signed-cookie key from ui.conf; random fallback (sessions then reset
+    on service restart, which fails safe)."""
+    conf = {}
+    try:
+        with open(UI_CONF) as f:
+            for line in f:
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    conf[k] = v
+    except OSError:
+        pass
+    sec = conf.get("SESSION_SECRET")
+    return bytes.fromhex(sec) if sec else os.urandom(32)
+
+
+app.secret_key = _session_secret()
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=datetime.timedelta(days=7),
+)
 
 
 def sh(cmd, timeout=10):
@@ -53,14 +80,10 @@ def load_kv(path):
     return out
 
 
-def check_auth(header):
+def verify_creds(user_pass):
     conf = load_kv(UI_CONF)
     salt, digest = conf.get("AUTH_SALT"), conf.get("AUTH_HASH")
-    if not (salt and digest and header.startswith("Basic ")):
-        return False
-    try:
-        user_pass = base64.b64decode(header[6:]).decode()
-    except Exception:
+    if not (salt and digest):
         return False
     calc = hashlib.pbkdf2_hmac("sha256", user_pass.encode(),
                                bytes.fromhex(salt),
@@ -68,14 +91,54 @@ def check_auth(header):
     return hmac.compare_digest(calc, digest)
 
 
+def check_auth(header):
+    """Basic auth stays valid for curl/scripts alongside browser sessions."""
+    if not header.startswith("Basic "):
+        return False
+    try:
+        user_pass = base64.b64decode(header[6:]).decode()
+    except Exception:
+        return False
+    return verify_creds(user_pass)
+
+
 def authed(fn):
     @wraps(fn)
     def wrap(*a, **kw):
-        if not check_auth(request.headers.get("Authorization", "")):
-            return Response("auth required", 401,
-                            {"WWW-Authenticate": 'Basic realm="halow"'})
-        return fn(*a, **kw)
+        if session.get("authed"):
+            return fn(*a, **kw)
+        if check_auth(request.headers.get("Authorization", "")):
+            return fn(*a, **kw)
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "auth required"}), 401
+        return redirect("/login")
     return wrap
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("authed"):
+        return redirect("/")
+    error = ""
+    if request.method == "POST":
+        user = request.form.get("username", "")
+        pw = request.form.get("password", "")
+        if verify_creds(f"{user}:{pw}"):
+            session.permanent = True
+            session["authed"] = True
+            session["user"] = user
+            return redirect("/")
+        time.sleep(1)  # slow brute force; PBKDF2 already costs ~0.1s
+        error = "wrong username or password"
+    return Response(LOGIN_PAGE.replace("__ERROR__",
+                    f'<p class="err">{error}</p>' if error else ""),
+                    mimetype="text/html")
+
+
+@app.get("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
 
 
 # ---------- HaLow ----------
@@ -270,6 +333,41 @@ def index():
     return Response(PAGE, mimetype="text/html")
 
 
+LOGIN_PAGE = r"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>halow-gw login</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--fg:#c9d1d9;--dim:#8b949e;
+--acc:#58a6ff;--bad:#f85149}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.5 -apple-system,Segoe UI,Roboto,monospace;display:flex;
+align-items:center;justify-content:center;min-height:100vh}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+padding:32px 36px;width:320px}
+h1{font-size:18px;margin:0 0 4px;color:var(--acc)}
+p.sub{color:var(--dim);margin:0 0 20px;font-size:12px}
+label{display:block;color:var(--dim);font-size:12px;margin:12px 0 4px}
+input{width:100%;background:#0d1117;border:1px solid var(--line);
+color:var(--fg);border-radius:6px;padding:9px 10px;font:inherit}
+input:focus{outline:none;border-color:var(--acc)}
+button{width:100%;margin-top:20px;background:var(--acc);color:#0d1117;
+border:none;border-radius:6px;padding:10px;font:inherit;font-weight:600;
+cursor:pointer}button:hover{filter:brightness(1.1)}
+.err{color:var(--bad);font-size:13px;margin:12px 0 0}
+</style></head><body>
+<form class="card" method="post" action="/login">
+<h1>halow-gw</h1>
+<p class="sub">mesh gateway · 192.168.51.202</p>
+<label for="u">username</label>
+<input id="u" name="username" autocomplete="username" autofocus>
+<label for="p">password</label>
+<input id="p" name="password" type="password" autocomplete="current-password">
+__ERROR__
+<button type="submit">sign in</button>
+</form></body></html>"""
+
+
 PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -304,7 +402,8 @@ border-radius:6px;padding:5px 8px;font:inherit;width:110px}
 .stat .v{font-size:18px}.stat .k{color:var(--dim);font-size:12px}
 </style></head><body>
 <header><h1>halow-gw</h1><nav id="nav"></nav>
-<span id="clock" style="margin-left:auto;color:var(--dim)"></span></header>
+<span id="clock" style="margin-left:auto;color:var(--dim)"></span>
+<a href="/logout" style="color:var(--dim);margin-left:14px;text-decoration:none">logout</a></header>
 <main id="main"></main>
 <script>
 const TABS=["Overview","HaLow","Router","Nodes"];let tab="Overview";

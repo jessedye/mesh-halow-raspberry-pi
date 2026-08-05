@@ -33,7 +33,8 @@ import hashlib,sys
 print(hashlib.pbkdf2_hmac("sha256",sys.argv[2].encode(),bytes.fromhex(sys.argv[1]),100000).hex())
 PY
 )
-printf 'AUTH_SALT=%s\nAUTH_HASH=%s\nAUTH_ITER=100000\n' "$SALT" "$HASH" > "$T/ui.conf"
+SESSION_SECRET=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+printf 'AUTH_SALT=%s\nAUTH_HASH=%s\nAUTH_ITER=100000\nSESSION_SECRET=%s\n' "$SALT" "$HASH" "$SESSION_SECRET" > "$T/ui.conf"
 sed -e "s|CHANGE-ME|${ADMIN_TOKEN}|g" "$REPO/config/nodes.json.example" > "$T/nodes.json"
 scp -q "$T/halow.env" "$T/ui.conf" "$T/nodes.json" "$PI:/tmp/halow-deploy/" 2>/dev/null || {
   ssh "$PI" 'mkdir -p /tmp/halow-deploy && chmod 700 /tmp/halow-deploy'
