@@ -10,6 +10,7 @@
 #   halowctl join-log [mac|--all|--selftest]  association forensics (read-only)
 #   halowctl health            station health ladder view (read-only)
 #   halowctl driver status|rebuild [KVER]|hold|unhold  kernel-upgrade interlock
+#   halowctl role show|check|set-gateway|set-bridge [uplink=halow|wifi] [eth=mgmt|downlink] [hold=N]|commit  bridged mode
 #   halowctl mode ap|sta       broadcast the SSID, or join it as a station
 #   halowctl probe             reload the driver and report chip probe result
 #   halowctl restart|stop      control the AP service
@@ -287,6 +288,87 @@ PY
   join-log)
     shift
     exec /usr/local/bin/halow-join-log "$@"
+    ;;
+  role)
+    # Bridged mode (user request 2026-08-05): the Pi as a remote bridge.
+    #   gateway (default): halow0 AP + eth0 upstream NAT (today's role)
+    #   bridge uplink=halow: halow0 STA joins another gateway's mesh;
+    #                        downlink mesh-2g AP (+ eth0 if eth=downlink)
+    #   bridge uplink=wifi:  wlan0 STA joins an upstream WiFi (nmcli
+    #                        profile bridge-uplink); downlink eth0
+    # SAFETY: a role switch reconfigures the interface you may be managing
+    # through. set-bridge arms a dead-man rollback — unless 'role commit'
+    # runs within hold= seconds (default 300), the Pi restores gateway.
+    sub=${2:-show}
+    setkey() { sudo sed -i "s|^$1=.*|$1=$2|" "$ENV"; grep -q "^$1=" "$ENV" || echo "$1=$2" | sudo tee -a "$ENV" >/dev/null; }
+    case "$sub" in
+      show)
+        R=$(grep -oP '^HALOW_ROLE=\K.*' "$ENV" 2>/dev/null || echo gateway)
+        U=$(grep -oP '^HALOW_BRIDGE_UPLINK=\K.*' "$ENV" 2>/dev/null || echo halow)
+        E=$(grep -oP '^HALOW_BRIDGE_ETH=\K.*' "$ENV" 2>/dev/null || echo mgmt)
+        echo "role: $R"
+        [ "$R" = bridge ] && echo "  uplink: $U   eth0: $E"
+        if systemctl is-active halow-role-rollback.timer >/dev/null 2>&1; then
+          echo "  ROLLBACK ARMED — run 'halowctl role commit' to keep this role"
+        fi
+        echo "  services: halow-ap=$(systemctl is-active halow-ap 2>/dev/null||true) halow-sta=$(systemctl is-active halow-sta 2>/dev/null||true)"
+        ;;
+      check)
+        # render + validate BOTH role configs without applying (bench-safe)
+        sudo /usr/local/bin/halow-bridge-net check gateway
+        sudo /usr/local/bin/halow-bridge-net check bridge
+        ;;
+      wifi-uplink)
+        shift 2
+        SSID=""; for kv in "$@"; do [ "${kv%%=*}" = ssid ] && SSID=${kv#*=}; done
+        [ -n "$SSID" ] || { echo "usage: halowctl role wifi-uplink ssid=NAME (psk on stdin)"; exit 1; }
+        PSK=$(head -c 128)
+        sudo nmcli con delete bridge-uplink >/dev/null 2>&1 || true
+        sudo nmcli con add type wifi ifname wlan0 con-name bridge-uplink ssid "$SSID" >/dev/null
+        sudo nmcli con modify bridge-uplink wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$PSK" connection.autoconnect no >/dev/null
+        echo "bridge-uplink profile set for SSID '$SSID' (psk stored in NM, not echoed)"
+        ;;
+      set-gateway)
+        setkey HALOW_ROLE gateway
+        sudo /usr/local/bin/halow-bridge-net apply gateway
+        sudo systemctl stop halow-sta 2>/dev/null || true
+        sudo nmcli con down bridge-uplink 2>/dev/null || true
+        sudo systemctl stop halow-role-rollback.timer halow-role-rollback.service 2>/dev/null || true
+        echo "role: gateway restored"
+        ;;
+      set-bridge)
+        shift 2
+        HOLD=300; UPL=""
+        for kv in "$@"; do case "${kv%%=*}" in
+          uplink) setkey HALOW_BRIDGE_UPLINK "${kv#*=}"; UPL=${kv#*=};;
+          eth)    setkey HALOW_BRIDGE_ETH "${kv#*=}";;
+          hold)   HOLD=${kv#*=};;
+        esac; done
+        UPL=${UPL:-$(grep -oP '^HALOW_BRIDGE_UPLINK=\K.*' "$ENV" 2>/dev/null||echo halow)}
+        setkey HALOW_ROLE bridge
+        if ! sudo /usr/local/bin/halow-bridge-net check bridge >/dev/null 2>&1; then
+          setkey HALOW_ROLE gateway
+          echo "REFUSED: bridge config failed validation; role unchanged"; exit 1
+        fi
+        sudo systemd-run --on-active="${HOLD}s" --unit=halow-role-rollback \
+          /usr/local/bin/halowctl role set-gateway >/dev/null 2>&1 || true
+        echo "ROLLBACK ARMED (${HOLD}s) — reverts to gateway unless 'halowctl role commit'"
+        if [ "$UPL" = wifi ]; then
+          sudo systemctl stop halow-ap 2>/dev/null || true
+          sudo nmcli con up bridge-uplink 2>/dev/null || echo "  (bridge-uplink profile missing — run 'role wifi-uplink' first)"
+        else
+          sudo "$0" mode sta >/dev/null 2>&1 || echo "  (halow STA start deferred — needs an upstream mesh AP)"
+        fi
+        sudo /usr/local/bin/halow-bridge-net apply bridge
+        echo "role: bridge (uplink=$UPL) — verify the uplink got an address, then 'halowctl role commit'"
+        ;;
+      commit)
+        sudo systemctl stop halow-role-rollback.timer halow-role-rollback.service 2>/dev/null || true
+        systemctl reset-failed halow-role-rollback.service 2>/dev/null || true
+        echo "role committed — rollback disarmed"
+        ;;
+      *) echo "usage: halowctl role show|check|wifi-uplink ssid=..|set-gateway|set-bridge [uplink=halow|wifi] [eth=mgmt|downlink] [hold=N]|commit"; exit 1 ;;
+    esac
     ;;
   node)
     NJ=/etc/halow/nodes.json

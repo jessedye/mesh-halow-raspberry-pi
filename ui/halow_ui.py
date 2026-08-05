@@ -1587,6 +1587,63 @@ def _probe(addr, deadline):
     return r
 
 
+@app.get("/api/role")
+@authed
+def api_role():
+    """Current role + the validated bridge/gateway config check."""
+    env = load_kv(ENV_CONF)
+    out = {"role": env.get("HALOW_ROLE", "gateway"),
+           "uplink": env.get("HALOW_BRIDGE_UPLINK", "halow"),
+           "eth": env.get("HALOW_BRIDGE_ETH", "mgmt"),
+           "rollback_armed":
+           sh("systemctl is-active halow-role-rollback.timer").strip()
+           == "active",
+           "ap_active": sh("systemctl is-active halow-ap").strip(),
+           "sta_active": sh("systemctl is-active halow-sta").strip()}
+    if request.args.get("check") == "1":
+        out["check"] = sh("sudo /usr/local/bin/halowctl role check",
+                          timeout=15)
+    return jsonify(out)
+
+
+@app.post("/api/config/role")
+@authed
+def api_config_role():
+    """Role switch. Bridge set arms a dead-man rollback (see halowctl
+    role). Identity/network change -> confirm=1 required for anything
+    other than the safe 'commit'."""
+    op = request.form.get("op", "")
+    if op == "commit":
+        ok, o = halowctl(["role", "commit"])
+    elif op == "gateway":
+        if request.form.get("confirm") != "1":
+            return jsonify({"error": "needs confirm=1: reconfigures NAT/"
+                            "DHCP"}), 400
+        ok, o = halowctl(["role", "set-gateway"], timeout=40)
+    elif op == "bridge":
+        if request.form.get("confirm") != "1":
+            return jsonify({"error": "needs confirm=1: switches the Pi to a "
+                            "downstream bridge; arms a rollback"}), 400
+        import re as _re
+        args = ["role", "set-bridge"]
+        up = request.form.get("uplink", "halow")
+        if up not in ("halow", "wifi"):
+            return jsonify({"error": "uplink must be halow or wifi"}), 400
+        args.append(f"uplink={up}")
+        eth = request.form.get("eth")
+        if eth in ("mgmt", "downlink"):
+            args.append(f"eth={eth}")
+        hold = request.form.get("hold", "300")
+        if not hold.isdigit():
+            return jsonify({"error": "hold must be numeric"}), 400
+        args.append(f"hold={hold}")
+        ok, o = halowctl(args, timeout=60)
+    else:
+        return jsonify({"error": "op must be gateway|bridge|commit"}), 400
+    return (jsonify({"ok": True, "output": o}) if ok
+            else (jsonify({"error": o}), 500))
+
+
 @app.get("/api/reach")
 @authed
 def api_reach():
@@ -2140,12 +2197,27 @@ async function setOvr(){
  if(extra===null)return;
  await hpost("/api/halow/set",Object.assign({channel:ch,width:w},extra))}
 async function router(){const r=await j("/api/router");
+ let rl={role:"gateway"};try{rl=await j("/api/role")}catch(e){}
+ const roleCard=`<div class="card"><h2>role — <span class="${rl.role==="gateway"?"ok":"warn"}">${esc(rl.role)}</span>${rl.role==="bridge"?` (uplink ${esc(rl.uplink)}, eth0 ${esc(rl.eth)})`:""}${rl.rollback_armed?' · <span class="bad">ROLLBACK ARMED</span>':""}</h2>
+ <p style="color:var(--dim)">gateway = HaLow AP + eth0 upstream NAT (today). bridge = the Pi joins
+ another network as a client (uplink) and serves local devices (downlink), NAT toward the uplink.
+ A live switch reconfigures the interface you manage through, so bridge arms a dead-man rollback.</p>
+ <p>${rl.rollback_armed
+  ?`<button class="act" onclick="roleOp('commit')">commit (keep bridge)</button>
+    <button class="act" onclick="roleOp('gateway',1)">revert to gateway now</button>`
+  :rl.role==="gateway"
+  ?`uplink <select id="rl-up"><option>halow</option><option>wifi</option></select>
+    eth0 <select id="rl-eth"><option>mgmt</option><option>downlink</option></select>
+    <button class="act" onclick="roleBridge()">switch to bridge</button>
+    <button class="act" onclick="roleCheck(this)">validate configs</button>`
+  :`<button class="act" onclick="roleOp('gateway',1)">back to gateway</button>`}</p>
+ <pre id="rl-out"></pre></div>`;
  const ifs=r.interfaces.map(i=>{const a=(i.addr_info||[]).map(x=>x.local+"/"+x.prefixlen).join(" ");
   return `<tr><td>${esc(i.ifname)}</td><td class="${i.operstate==='UP'?'ok':'warn'}">${esc(i.operstate)}</td><td>${esc(a)}</td></tr>`}).join("");
  const ls=r.leases.length?r.leases.map(l=>
   `<tr><td>${esc(l.host)}</td><td>${esc(l.ip)}</td><td>${esc(l.mac)}</td></tr>`).join("")
   :`<tr><td colspan=3 class="warn">no leases</td></tr>`;
- return `<div class="card"><h2>interfaces — forwarding ${r.forwarding==="1"?"<span class='ok'>on</span>":"<span class='bad'>OFF</span>"} · dnsmasq ${esc(r.dnsmasq)}
+ return `${roleCard}<div class="card"><h2>interfaces — forwarding ${r.forwarding==="1"?"<span class='ok'>on</span>":"<span class='bad'>OFF</span>"} · dnsmasq ${esc(r.dnsmasq)}
  · 2.4G AP mesh-2g ${r.wifi_ap?"<span class='ok'>on</span>":"<span class='warn'>off</span>"}
  <button class="act" style="float:right" onclick="wifiAp('${r.wifi_ap?"off":"on"}')">${r.wifi_ap?"turn off":"turn on"}</button></h2>
  <table><tr><th>if</th><th>state</th><th>addrs</th></tr>${ifs}</table></div>
@@ -2153,6 +2225,21 @@ async function router(){const r=await j("/api/router");
  <table><tr><th>host</th><th>ip</th><th>mac</th></tr>${ls}</table></div>
  <div class="card"><h2>firewall / NAT</h2><pre>${esc(r.nft)}</pre></div>
  <div class="card"><h2>routes</h2><pre>${esc(r.routes.map(x=>`${x.dst||"default"} via ${x.gateway||"-"} dev ${x.dev}`).join("\n"))}</pre></div>`}
+async function roleOp(op,confirm){const fd=new FormData();fd.append("op",op);
+ if(confirm)fd.append("confirm","1");
+ const r=await(await fetch("/api/config/role",{method:"POST",body:fd})).json();
+ const el=document.getElementById("rl-out");if(el)el.textContent=r.error||r.output;
+ setTimeout(render,1500)}
+async function roleBridge(){
+ if(!confirm("Switch the Pi to a downstream BRIDGE? It joins another network as a client and serves local devices. This reconfigures NAT/DHCP and arms a 5-min dead-man rollback — run 'commit' to keep it."))return;
+ const fd=new FormData();fd.append("op","bridge");fd.append("confirm","1");
+ fd.append("uplink",$("#rl-up").value);fd.append("eth",$("#rl-eth").value);
+ const r=await(await fetch("/api/config/role",{method:"POST",body:fd})).json();
+ document.getElementById("rl-out").textContent=r.error||r.output;setTimeout(render,2000)}
+async function roleCheck(btn){btn.disabled=true;
+ try{const d=await j("/api/role?check=1");
+ document.getElementById("rl-out").textContent=d.check||"(no output)"}
+ finally{btn.disabled=false}}
 async function nodes(){const d=await j("/api/nodes");
  if(d.error&&!d.nodes.length)return `<p class="warn">${esc(d.error)}</p>`;
  const scls=s=>s==="healthy"?"ok":(s==="stale"||s==="unknown"||s==="wifi-down")?"warn":"bad";

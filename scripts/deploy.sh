@@ -87,6 +87,7 @@ sudo install -m755 scripts/halow-linkd /usr/local/bin/
 sudo install -m755 scripts/halow_rungcost.py /usr/local/bin/
 sudo install -m755 scripts/halow-kernel-guard /usr/local/bin/
 sudo install -m755 scripts/halow-watch /usr/local/bin/
+sudo install -m755 scripts/halow-bridge-net /usr/local/bin/
 sudo install -m644 config/apt-halow-kernel-guard /etc/apt/apt.conf.d/99halow-kernel-guard
 sudo mkdir -p /etc/systemd/system.conf.d
 sudo install -m644 config/watchdog-system.conf /etc/systemd/system.conf.d/50-halow-watchdog.conf
