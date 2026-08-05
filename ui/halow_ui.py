@@ -895,6 +895,23 @@ def api_halow_link(mac=None):
             if tx_pkts else None,
             "retry_pct": round(100 * retries / tx_pkts, 2) if tx_pkts else None,
         }
+    # health ladder merge (station-health.json, halow-mon roadmap 18):
+    # absent file -> health: null, shape otherwise unchanged. Health-only
+    # MACs (e.g. reserved never-seen nodes) appear with null telemetry so
+    # they are visible pre-association.
+    health = {}
+    try:
+        health = json.load(open("/var/lib/halow/station-health.json")
+                           ).get("stations", {})
+    except Exception:
+        pass
+    for m in out:
+        out[m]["health"] = health.get(m.lower())
+    for hm, h in health.items():
+        if mac is not None and hm != mac.lower():
+            continue
+        if hm not in out and not any(k.lower() == hm for k in out):
+            out[hm] = {"now": None, "n_samples": 0, "health": h}
     if mac is not None:
         return jsonify(out.get(mac.lower(), out.get(mac.upper(),
                        {"error": f"no samples for {mac}", "stations": list(out)})))
@@ -927,8 +944,8 @@ def api_metrics():
     summary = {}
     if samples:
         for k in ("temp_c", "load1", "mem_avail_kb", "stations",
-                  "disk_free_mb"):
-            vals = [s[k] for s in samples if k in s]
+                  "disk_free_mb", "sta_reachable"):
+            vals = [s[k] for s in samples if s.get(k) is not None]
             if vals:
                 summary[k] = {"min": min(vals), "max": max(vals),
                               "now": vals[-1]}
@@ -1173,7 +1190,9 @@ async function diag(){const nb=await j("/api/diag/neigh"),sv=await j("/api/diag/
  <div class="card"><h2>neighbors (ARP/NDP)</h2>
  <table><tr><th>ip</th><th>dev</th><th>mac</th><th>state</th></tr>${neigh}</table>
  <p style="color:var(--dim)">FAILED with a known mac = the "associated but answers no ARP" trap —
- now auto-detected as <code>dhcp_no_reach</code> in the Debug tab's join forensics.</p></div>
+ auto-classified each minute as <code>leased-no-arp</code> by the health ladder (HaLow tab)
+ and as <code>dhcp_no_reach</code> at join time in the Debug tab's forensics. This manual
+ view stays useful when the timer itself is suspect.</p></div>
  <div class="card"><h2>power / throttling</h2>
  <p>${pw.temp_c}°C · ${esc(pw.volts_core||"")} · ${pw.flags.map(f=>
   `<span class="${f.includes("NOW")?"bad":(f.includes("occurred")?"warn":"ok")}">${esc(f)}</span>`).join(" · ")}</p></div>
@@ -1341,6 +1360,9 @@ async function monCard(){try{const m=await j("/api/metrics?minutes=1440");
  catch(e){return `<div class="card"><h2>monitor</h2><p class="bad">${esc(e)}</p></div>`}}
 async function halow(){const h=await j("/api/halow");
  let cc=null;try{cc=await j("/api/halow/compat")}catch(e){}
+ let lk={stations:{}};try{lk=await j("/api/halow/link")}catch(e){}
+ const hcls=v=>v==="reachable"?"ok":(v==="quiet"||v==="never-seen"||v==="assoc-no-lease")?"warn":"bad";
+ const ago=t=>t?new Date(t*1000).toISOString().replace("T"," ").slice(0,19):"—";
  const profs=Object.entries(h.profiles).map(([n,p])=>{
   const v=cc&&cc.profiles&&cc.profiles[n];
   const badge=v&&v.compatible===false?'<span class="warn">strands pinned nodes</span>':"";
@@ -1348,10 +1370,17 @@ async function halow(){const h=await j("/api/halow");
    <td>ch ${p.channel}</td><td>op ${p.op_class}</td><td>${badge}</td>
    <td><button class="act" ${n===h.profile?"disabled":""}
      onclick="setProf('${n}')">apply</button></td></tr>`}).join("");
- const stas=h.stations.length?h.stations.map(s=>
-  `<tr><td>${esc(s.mac)}</td><td>${esc(s.signal||"")}</td><td>${esc(s.tx_bitrate||"")}</td>
-   <td>${esc(s.rx_bitrate||"")}</td><td>${esc(s.connected_time||"")}</td></tr>`).join("")
-  :`<tr><td colspan=5 class="warn">no stations associated</td></tr>`;
+ const stas=h.stations.length?h.stations.map(s=>{
+  const hh=(lk.stations[(s.mac||"").toLowerCase()]||{}).health;
+  return `<tr><td>${esc(s.mac)}</td><td>${esc(s.signal||"")}</td><td>${esc(s.tx_bitrate||"")}</td>
+   <td>${esc(s.rx_bitrate||"")}</td><td>${esc(s.connected_time||"")}</td>
+   <td class="${hh?hcls(hh.state):''}">${esc(hh?hh.state:"—")}</td></tr>`}).join("")
+  :`<tr><td colspan=6 class="warn">no stations associated</td></tr>`;
+ const known=Object.entries(lk.stations).filter(([m,v])=>v.health).map(([m,v])=>
+  `<tr><td>${esc(m)}</td><td class="${hcls(v.health.state)}">${esc(v.health.state||"")}</td>
+   <td>${esc(v.health.ip||"—")}</td><td>${v.health.expected_interval_s||"—"}s</td>
+   <td>${ago(v.health.last_seen_assoc)}</td></tr>`).join("")
+  ||`<tr><td colspan=5 class="warn">no health records yet</td></tr>`;
  return `<div class="card"><h2>radio — ${esc(h.ssid||"?")} · mode ${esc(h.mode)} (${h.present?"interface up":"<span class='bad'>interface absent</span>"})</h2>
  <pre>${esc(h.iw_info||h.chip_dmesg)}</pre>
  <p><button class="act" onclick="probe(this)">Probe chip</button>
@@ -1365,7 +1394,11 @@ async function halow(){const h=await j("/api/halow");
  — valid US: 1MHz odd 1-51 · 2MHz 2,6..50 · 4MHz 8,16..48 · 8MHz 12,28,44</p>
  <pre id="halow-out"></pre></div>
  <div class="card"><h2>stations</h2>
- <table><tr><th>mac</th><th>signal</th><th>tx</th><th>rx</th><th>connected</th></tr>${stas}</table></div>`}
+ <table><tr><th>mac</th><th>signal</th><th>tx</th><th>rx</th><th>connected</th><th>health</th></tr>${stas}</table></div>
+ <div class="card"><h2>known stations (health ladder)</h2>
+ <table><tr><th>mac</th><th>state</th><th>ip</th><th>interval</th><th>last assoc</th></tr>${known}</table>
+ <p style="color:var(--dim)">assoc→lease→ARP→ICMP walked each minute; absent stations judged by
+ sleep-aware freshness (3× their own interval) and never probed — quiet is healthy, lost is not.</p></div>`}
 async function hpost(u,body){const fd=new FormData();
  for(const[k,v]of Object.entries(body))if(v!==""&&v!=null)fd.append(k,v);
  const r=await fetch(u,{method:"POST",body:fd});const d=await r.json();

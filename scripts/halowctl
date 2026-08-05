@@ -8,6 +8,7 @@
 #   halowctl gen               regenerate hostapd conf from env+profile
 #   halowctl stations          associated STA dump
 #   halowctl join-log [mac|--all|--selftest]  association forensics (read-only)
+#   halowctl health            station health ladder view (read-only)
 #   halowctl mode ap|sta       broadcast the SSID, or join it as a station
 #   halowctl probe             reload the driver and report chip probe result
 #   halowctl restart|stop      control the AP service
@@ -285,6 +286,27 @@ PY
   join-log)
     shift
     exec /usr/local/bin/halow-join-log "$@"
+    ;;
+  health)
+    python3 - <<'PY'
+import json, time
+try:
+    h = json.load(open("/var/lib/halow/station-health.json"))["stations"]
+except Exception:
+    print("no health records yet (halow-mon writes them once a minute)")
+    raise SystemExit(0)
+if not h:
+    print("no stations known")
+    raise SystemExit(0)
+fmt = "%Y-%m-%d %H:%M:%S"
+print(f"{'MAC':18} {'STATE':15} {'IP':14} {'INTERVAL':>8} {'LAST ASSOC':20} DETAIL")
+for mac, r in sorted(h.items()):
+    last = (time.strftime(fmt, time.localtime(r["last_seen_assoc"]))
+            if r.get("last_seen_assoc") else "never")
+    print(f"{mac:18} {str(r.get('state')):15} {str(r.get('ip') or '-'):14} "
+          f"{str(r.get('expected_interval_s')) + 's':>8} {last:20} "
+          f"{r.get('detail') or ''}")
+PY
     ;;
   mode)
     m=${2:?usage: halowctl mode ap|sta}

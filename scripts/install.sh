@@ -72,7 +72,7 @@ sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   linux-headers-rpi-v8 build-essential git bison flex pkg-config \
   libssl-dev libnl-3-dev libnl-genl-3-dev libnl-route-3-dev \
-  libusb-1.0-0-dev device-tree-compiler raspi-utils
+  libusb-1.0-0-dev device-tree-compiler raspi-utils iputils-arping
 
 # Kernel image and headers must be the same version (headers track the repo,
 # a freshly flashed image may boot older) — reboot before rerunning if this trips.

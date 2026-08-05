@@ -153,7 +153,16 @@ nothing on the v1 rejected list); verifier corrections are folded in.
     frequency+width, NOT channel number — the two stacks number channels
     differently (Pi regdb 1 MHz = odd 43-51 at x.5 MHz; node list uses
     44/46/48/50 at integer MHz). [small/high — best ratio in the list]
-18. **Per-station health ladder in halow-mon** — walk each associated MAC
+18. **Per-station health ladder in halow-mon** — DONE 2026-08-05
+    pre-association scope (classifier unit matrix 7/7 incl. the
+    quiet/lost identical-silence pair; zero-station pass 0.20s [M];
+    reserved node MACs visible as never-seen with known=true; tcpdump
+    proved zero probe frames to absent stations; secrets audit clean in
+    state file and API; event-log stays halow-ui-writable after root
+    appends; /api/halow/link carries health with null-telemetry MACs and
+    degrades to the old shape without the state file. Probe-path runs
+    8-11 — first join classified, the pulled-power trap, sleep-awareness
+    end-to-end, walk bound — need a station). — walk each associated MAC
     through assoc → lease → ARP → real ICMP each minute; classified
     transitions (assoc-no-lease, leased-no-arp) into station-events. The
     "associated but answers no ARP" trap stops being a manual Diag hint.

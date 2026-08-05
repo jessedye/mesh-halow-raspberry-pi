@@ -9,15 +9,30 @@ Reachability is tested with ICMP to the upstream gateway, not by asking
 the driver how it feels (the bench's dead-association lesson)."""
 import json
 import os
+import shutil
 import subprocess
 import time
 
 STATE_DIR = "/var/lib/halow"
 METRICS = os.path.join(STATE_DIR, "metrics.jsonl")
 STATE = os.path.join(STATE_DIR, "mon-state.json")
+HEALTH = os.path.join(STATE_DIR, "station-health.json")
+EVENTS_LOG = os.path.join(STATE_DIR, "station-events.log")
 RING_LINES = 2880  # 2 days at 1/min
 UPSTREAM = "192.168.50.1"
 DISK_LOW_MB = 512  # SD low-water; mirrored in halow_ui.py
+
+# --- station health ladder (roadmap 18) ---
+LEASES = "/var/lib/misc/dnsmasq.leases"
+RESERVATIONS = "/etc/dnsmasq.d/halow-reservations.conf"
+NODES_JSON = "/etc/halow/nodes.json"  # tokens live here: read mac+interval ONLY
+HOLD_MULTIPLIER = 3     # nodewatch.py:52 — same constant, same justification
+DEFAULT_INTERVAL_S = 3600  # nodewatch's conservative fallback: under-alert
+HOLD_SAMPLES = 2        # the healer's two-samples-not-a-blip rule
+ARPING_W = 3
+PING_W = 5   # S1G power-save buffers frames at the AP; a slow answer is normal
+WALK_BUDGET_S = 30      # whole walk wall-clock cap; must beat the 60s timer
+PRUNE_UNKNOWN_S = 86400
 
 DEFAULTS = {"ap_restarts": 0, "dnsmasq_restarts": 0, "eth0_bounces": 0,
             "ap_down_streak": 0, "upstream_down_streak": 0,
@@ -63,6 +78,286 @@ def act(state, key, note):
     subprocess.run(["logger", "-t", "halow-mon", note])
 
 
+def parse_station_dump(dump):
+    """One parse for both the metrics sample and the health walk.
+    MACs are lowercased here, the single ingestion point."""
+    out, cur = [], None
+    for line in dump.splitlines():
+        line = line.strip()
+        if line.startswith("Station"):
+            cur = {"mac": line.split()[1].lower()}
+            out.append(cur)
+        elif cur is not None and ":" in line:
+            k, v = [x.strip() for x in line.split(":", 1)]
+            try:
+                if k == "signal":
+                    cur["signal_dbm"] = int(v.split()[0])
+                elif k == "tx bitrate":
+                    cur["tx_mbps"] = float(v.split()[0])
+                elif k == "rx bitrate":
+                    cur["rx_mbps"] = float(v.split()[0])
+                elif k == "inactive time":
+                    cur["inactive_ms"] = int(v.split()[0])
+                elif k in ("tx packets", "tx retries", "tx failed"):
+                    cur[k.replace(" ", "_")] = int(v)
+            except (ValueError, IndexError):
+                pass
+    return out
+
+
+def read_leases():
+    out = {}
+    try:
+        for line in open(LEASES):
+            p = line.split()
+            if len(p) >= 3:
+                out[p[1].lower()] = p[2]
+    except OSError:
+        pass
+    return out
+
+
+def read_reservations():
+    out = {}
+    try:
+        for line in open(RESERVATIONS):
+            if line.startswith("dhcp-host="):
+                p = line.strip()[len("dhcp-host="):].split(",")
+                if len(p) >= 2:
+                    out[p[0].lower()] = p[1]
+    except OSError:
+        pass
+    return out
+
+
+def read_neigh():
+    """[{ip, mac, state}] from the kernel neighbor cache on halow0."""
+    out = []
+    try:
+        raw = subprocess.run(["ip", "-j", "neigh", "show", "dev", "halow0"],
+                             capture_output=True, text=True, timeout=5).stdout
+        for n in json.loads(raw or "[]"):
+            if n.get("dst") and n.get("lladdr"):
+                out.append({"ip": n["dst"], "mac": n["lladdr"].lower(),
+                            "state": (n.get("state") or [""])[0]})
+    except Exception:
+        pass
+    return out
+
+
+def known_intervals():
+    """mac -> expected_interval_s from nodes.json. This is the ONLY reader
+    of that file here: it holds bearer tokens, so extract two keys and
+    drop the rest — nothing else may reach state, logs, or the API."""
+    out = {}
+    try:
+        for n in json.load(open(NODES_JSON)):
+            mac = str(n.get("mac", "")).lower()
+            if mac:
+                try:
+                    out[mac] = int(n.get("expected_interval_s",
+                                         DEFAULT_INTERVAL_S))
+                except (TypeError, ValueError):
+                    out[mac] = DEFAULT_INTERVAL_S
+    except Exception:
+        pass
+    return out
+
+
+def classify(assoc, ip, arp_ok, icmp_ok, last_seen_assoc, interval_s, now,
+             known):
+    """Pure ladder classifier — no subprocess calls, unit-testable.
+    Present stations: highest rung achieved. Absent stations: freshness
+    only (never probed) — quiet is healthy inside 3x the node's own
+    interval, the nodewatch rule."""
+    if assoc:
+        if ip is None:
+            return "assoc-no-lease", "no IP in lease/reservation/neigh"
+        if icmp_ok:
+            return "reachable", ""
+        if arp_ok:
+            return "arp-no-icmp", "L2 answers, IP stack does not"
+        return "leased-no-arp", "the dead-association trap"
+    if last_seen_assoc is None:
+        return "never-seen", ""
+    if now - last_seen_assoc <= HOLD_MULTIPLIER * interval_s:
+        return "quiet", ""
+    return "lost", f"silent past {HOLD_MULTIPLIER}x{interval_s}s"
+
+
+def load_health():
+    try:
+        h = json.load(open(HEALTH))
+        h.setdefault("_cursor", 0)
+        h.setdefault("stations", {})
+        return h
+    except Exception:
+        return {"_cursor": 0, "stations": {}}
+
+
+def append_events(lines):
+    if not lines:
+        return
+    with open(EVENTS_LOG, "a") as f:
+        for ln in lines:
+            f.write(ln + "\n")
+    # two writers, two UIDs: if root created the file, halow-ui's hostapd
+    # hook would be locked out of its own log — hand it back
+    try:
+        if os.stat(EVENTS_LOG).st_uid == 0:
+            os.chmod(EVENTS_LOG, 0o644)
+            shutil.chown(EVENTS_LOG, "halow-ui", "halow-ui")
+    except (OSError, LookupError):
+        pass
+
+
+def health_walk(parsed, now):
+    """Walk associated MACs up the ladder (bounded), judge absent MACs by
+    freshness, commit transitions with the two-sample hold. Returns the
+    count of reachable stations for the metrics sample."""
+    health = load_health()
+    stations = health["stations"]
+    leases, reservations = read_leases(), read_reservations()
+    neigh = read_neigh()
+    neigh_by_mac = {n["mac"]: n for n in neigh}
+    intervals = known_intervals()
+    known_macs = set(reservations) | set(intervals)
+    assoc_macs = [e["mac"] for e in parsed]
+
+    deadline = time.monotonic() + WALK_BUDGET_S
+    order = sorted(assoc_macs)
+    cur = health["_cursor"] % max(len(order), 1) if order else 0
+    order = order[cur:] + order[:cur]
+    events = []
+    walked = set()
+
+    def commit(mac, rec, new_state, detail, extra=""):
+        old = rec["state"]
+        rec["state"], rec["since"] = new_state, now
+        rec["pending"], rec["pending_streak"] = None, 0
+        rec["detail"] = detail
+        if old is None and new_state in ("never-seen", "quiet"):
+            return  # pre-association steady state: no event, no alarm
+        if old == new_state:
+            return
+        tok = "HEALTH-" + new_state.upper().replace("_", "-")
+        ip = rec.get("ip") or ""
+        events.append(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {tok} {mac}"
+                      f"{' ip=' + ip if ip else ''}"
+                      f"{' was=' + old if old else ''}{extra}")
+
+    def consider(mac, rec, new_state, detail):
+        if new_state == rec["state"]:
+            rec["pending"], rec["pending_streak"] = None, 0
+            rec["detail"] = detail
+            return
+        immediate = (new_state == "reachable" or rec["state"] is None
+                     or (rec["state"] == "quiet" and new_state == "lost"))
+        if immediate:
+            commit(mac, rec, new_state, detail)
+            return
+        if rec["pending"] == new_state:
+            rec["pending_streak"] += 1
+        else:
+            rec["pending"], rec["pending_streak"] = new_state, 1
+        if rec["pending_streak"] >= HOLD_SAMPLES:
+            commit(mac, rec, new_state, detail, extra=f" held={HOLD_SAMPLES}")
+
+    def fresh_rec():
+        return {"state": None, "since": now, "pending": None,
+                "pending_streak": 0, "last_seen_assoc": None, "ip": None,
+                "ip_source": None, "known": False, "expected_interval_s":
+                DEFAULT_INTERVAL_S, "stale_after_s":
+                HOLD_MULTIPLIER * DEFAULT_INTERVAL_S,
+                "rungs": {}, "arp_method": None, "probe_ms": None,
+                "detail": ""}
+
+    # --- present stations: up the ladder, under budget ---
+    for mac in order:
+        rec = stations.setdefault(mac, fresh_rec())
+        rec["last_seen_assoc"] = now
+        rec["known"] = mac in known_macs
+        iv = intervals.get(mac, DEFAULT_INTERVAL_S)
+        rec["expected_interval_s"] = iv
+        rec["stale_after_s"] = HOLD_MULTIPLIER * iv
+        if time.monotonic() > deadline:
+            rec["detail"] = "walk=skipped"
+            continue
+        walked.add(mac)
+        t0 = time.monotonic()
+        ip, src = None, None
+        for cand, s in ((leases.get(mac), "lease"),
+                        (reservations.get(mac), "reservation"),
+                        ((neigh_by_mac.get(mac) or {}).get("ip"), "neigh")):
+            if cand:
+                ip, src = cand, s
+                break
+        arp_ok = icmp_ok = False
+        arp_method = None
+        if ip:
+            try:
+                arp_ok = subprocess.run(
+                    ["arping", "-c", "2", "-w", str(ARPING_W), "-I",
+                     "halow0", ip], capture_output=True,
+                    timeout=ARPING_W + 3).returncode == 0
+                arp_method = "arping"
+            except FileNotFoundError:
+                # degraded, not fatal: cache REACHABLE reflects recent
+                # kernel traffic, not a probe this pass — marked, never
+                # silent
+                n = neigh_by_mac.get(mac)
+                arp_ok = bool(n and n["state"] == "REACHABLE"
+                              and n["ip"] == ip)
+                arp_method = "cache"
+            except Exception:
+                arp_method = "arping"
+            try:
+                icmp_ok = subprocess.run(
+                    ["ping", "-c", "1", "-W", str(PING_W), "-n", ip],
+                    capture_output=True, timeout=PING_W + 3).returncode == 0
+            except Exception:
+                pass
+        rec.update({"ip": ip, "ip_source": src, "arp_method": arp_method,
+                    "probe_ms": int((time.monotonic() - t0) * 1000),
+                    "rungs": {"assoc": True, "lease": ip is not None,
+                              "arp": arp_ok, "icmp": icmp_ok}})
+        state, detail = classify(True, ip, arp_ok, icmp_ok, now,
+                                 iv, now, rec["known"])
+        consider(mac, rec, state, detail)
+
+    # advance the round-robin cursor past what we walked
+    if order and len(walked) < len(order):
+        health["_cursor"] = (cur + len(walked)) % len(order)
+    else:
+        health["_cursor"] = 0
+
+    # --- absent stations: freshness only, never probed ---
+    assoc_set = set(assoc_macs)
+    for mac in list(set(stations) | known_macs):
+        if mac in assoc_set:
+            continue
+        rec = stations.setdefault(mac, fresh_rec())
+        rec["known"] = mac in known_macs
+        iv = intervals.get(mac, DEFAULT_INTERVAL_S)
+        rec["expected_interval_s"] = iv
+        rec["stale_after_s"] = HOLD_MULTIPLIER * iv
+        rec["rungs"] = {}
+        if not rec["known"] and rec["last_seen_assoc"] is not None:
+            if rec["state"] != "gone":
+                commit(mac, rec, "gone", "unknown mac disassociated")
+            if now - rec["since"] > PRUNE_UNKNOWN_S:
+                del stations[mac]
+            continue
+        state, detail = classify(False, None, False, False,
+                                 rec["last_seen_assoc"], iv, now,
+                                 rec["known"])
+        consider(mac, rec, state, detail)
+
+    append_events(events)
+    atomic_write(HEALTH, json.dumps(health))
+    return sum(1 for r in stations.values() if r["state"] == "reachable")
+
+
 def main():
     st = load_state()
     now = int(time.time())
@@ -103,6 +398,17 @@ def main():
     else:
         st["upstream_down_streak"] = 0
 
+    # --- station parse (once) + health ladder walk ---
+    dump = sh("iw dev halow0 station dump")
+    parsed = parse_station_dump(dump)
+    try:
+        sta_reachable = health_walk(parsed, now)
+    except Exception as e:
+        # the ladder must never take the sampler or the healer down with it
+        subprocess.run(["logger", "-t", "halow-mon",
+                        f"health walk failed: {e.__class__.__name__}: {e}"])
+        sta_reachable = None
+
     # --- sample ---
     thr = sh("vcgencmd get_throttled")
     vfs = os.statvfs("/")
@@ -115,7 +421,8 @@ def main():
         "mem_avail_kb": next(int(x.split()[1]) for x in
                              open("/proc/meminfo") if "MemAvailable" in x),
         "throttled": thr.split("=")[-1] if "=" in thr else None,
-        "stations": sh("iw dev halow0 station dump").count("Station"),
+        "stations": len(parsed),
+        "sta_reachable": sta_reachable,
         "disk_free_mb": free_mb,
         "ap": ap_beaconing, "dnsmasq": dnsmasq_ok, "upstream": upstream_ok,
     }
@@ -131,29 +438,11 @@ def main():
 
     # per-station link samples — the raw material for a measured
     # TRANSPORT_HALOW metric (rate and delivery, never datasheet numbers)
-    dump = sh("iw dev halow0 station dump")
-    if dump:
+    if parsed:
         stations_log = os.path.join(STATE_DIR, "stations.jsonl")
-        cur = None
-        entries = []
-        for line in dump.splitlines():
-            line = line.strip()
-            if line.startswith("Station"):
-                cur = {"t": now, "mac": line.split()[1]}
-                entries.append(cur)
-            elif cur is not None and ":" in line:
-                k, v = [x.strip() for x in line.split(":", 1)]
-                if k == "signal":
-                    cur["signal_dbm"] = int(v.split()[0])
-                elif k == "tx bitrate":
-                    cur["tx_mbps"] = float(v.split()[0])
-                elif k == "rx bitrate":
-                    cur["rx_mbps"] = float(v.split()[0])
-                elif k in ("tx packets", "tx retries", "tx failed"):
-                    cur[k.replace(" ", "_")] = int(v)
         with open(stations_log, "a") as f:
-            for e in entries:
-                f.write(json.dumps(e) + "\n")
+            for e in parsed:
+                f.write(json.dumps({"t": now, **e}) + "\n")
         try:
             lines = open(stations_log).readlines()
             if len(lines) > RING_LINES * 4:
