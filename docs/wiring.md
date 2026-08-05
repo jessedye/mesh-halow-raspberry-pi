@@ -94,3 +94,11 @@ transferred here too eagerly.
 - **A solder bridge from 3V3 to GND on the module side** collapses the rail:
   host plays dead / port overcurrent-cuts. Disconnect the module power wire to
   prove it; the host revives instantly.
+
+**Update, second rework (2026-08-05 12:20):** after the pins were swapped
+again, the census went fully dark — IRQ no longer reacts in ANY phase
+(previously it rose on probe traffic). Passive sensing can no longer
+discriminate: dead wire still on the command path, module 3V3/GND
+disturbed, or the IRQ sense wire itself loose. Continuity-beep the four
+wires (19↔49, 21↔47, 22↔J2-10, 29↔J2-22) and verify 3.3 V at the module
+before the next census run. Census "good" = step 4 reads `| hi`.
