@@ -3,5 +3,7 @@
 halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl gen
 halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl set-profile *
 halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl set *
+halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl probe
+halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl mode ap, /usr/local/bin/halowctl mode sta
 halow-ui ALL=(root) NOPASSWD: /usr/sbin/nft list table ip halow
 halow-ui ALL=(root) NOPASSWD: /usr/bin/systemctl restart halow-ap

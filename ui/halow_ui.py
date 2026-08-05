@@ -48,7 +48,7 @@ def load_kv(path):
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     out[k] = v
-    except FileNotFoundError:
+    except OSError:
         pass
     return out
 
@@ -112,6 +112,7 @@ def api_halow():
         "iw_info": sh(f"iw dev {iface} info"),
         "stations": stations,
         "ssid": env.get("HALOW_SSID"),
+        "mode": env.get("HALOW_MODE", "ap"),
         "profile": env.get("HALOW_PROFILE"),
         "channel_override": env.get("HALOW_CHANNEL", ""),
         "width_override": env.get("HALOW_WIDTH", ""),
@@ -127,6 +128,23 @@ def api_halow_profile():
     name = request.form.get("name", "")
     ok = sh(f"sudo /usr/local/bin/halowctl set-profile {name} 2>&1", timeout=30)
     return jsonify({"applied": name, "output": ok})
+
+
+@app.post("/api/halow/probe")
+@authed
+def api_halow_probe():
+    out = sh("sudo /usr/local/bin/halowctl probe 2>&1", timeout=40)
+    return jsonify({"ok": "PROBE OK" in out, "output": out})
+
+
+@app.post("/api/halow/mode")
+@authed
+def api_halow_mode():
+    m = request.form.get("mode", "")
+    if m not in ("ap", "sta"):
+        return jsonify({"error": "mode must be ap or sta"}), 400
+    out = sh(f"sudo /usr/local/bin/halowctl mode {m} 2>&1", timeout=40)
+    return jsonify({"mode": m, "output": out})
 
 
 @app.post("/api/halow/set")
@@ -310,8 +328,11 @@ async function halow(){const h=await j("/api/halow");
   `<tr><td>${esc(s.mac)}</td><td>${esc(s.signal||"")}</td><td>${esc(s.tx_bitrate||"")}</td>
    <td>${esc(s.rx_bitrate||"")}</td><td>${esc(s.connected_time||"")}</td></tr>`).join("")
   :`<tr><td colspan=5 class="warn">no stations associated</td></tr>`;
- return `<div class="card"><h2>radio — ${esc(h.ssid||"?")} (${h.present?"interface up":"<span class='bad'>interface absent</span>"})</h2>
- <pre>${esc(h.iw_info||h.chip_dmesg)}</pre></div>
+ return `<div class="card"><h2>radio — ${esc(h.ssid||"?")} · mode ${esc(h.mode)} (${h.present?"interface up":"<span class='bad'>interface absent</span>"})</h2>
+ <pre>${esc(h.iw_info||h.chip_dmesg)}</pre>
+ <p><button class="act" onclick="probe(this)">Probe chip</button>
+ <button class="act" onclick="setMode('${h.mode==="ap"?"sta":"ap"}')">Switch to ${h.mode==="ap"?"STA (join mesh)":"AP (broadcast mesh)"}</button></p>
+ <pre id="probe-out"></pre></div>
  <div class="card"><h2>profiles — range ⟷ rate</h2>
  <table><tr><th></th><th>profile</th><th>width</th><th>channel</th><th>op class</th><th></th></tr>${profs}</table>
  <p style="color:var(--dim)">override: ch <input id="ch" placeholder="${esc(h.channel_override||'auto')}">
@@ -322,6 +343,12 @@ async function halow(){const h=await j("/api/halow");
  <table><tr><th>mac</th><th>signal</th><th>tx</th><th>rx</th><th>connected</th></tr>${stas}</table></div>`}
 async function setProf(n){const fd=new FormData();fd.append("name",n);
  await fetch("/api/halow/profile",{method:"POST",body:fd});render()}
+async function probe(btn){btn.disabled=true;btn.textContent="probing…";
+ try{const r=await(await fetch("/api/halow/probe",{method:"POST"})).json();
+ const el=document.getElementById("probe-out");
+ el.textContent=r.output;el.className=r.ok?"ok":"bad"}finally{btn.disabled=false;btn.textContent="Probe chip"}}
+async function setMode(m){const fd=new FormData();fd.append("mode",m);
+ await fetch("/api/halow/mode",{method:"POST",body:fd});render()}
 async function setOvr(){const fd=new FormData();
  if($("#ch").value)fd.append("channel",$("#ch").value);
  if($("#w").value)fd.append("width",$("#w").value);

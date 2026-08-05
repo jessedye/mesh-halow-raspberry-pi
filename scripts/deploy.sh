@@ -45,8 +45,10 @@ ssh "$PI" 'set -e
 cd ~/mesh-halow-raspberry-pi
 sudo mkdir -p /etc/halow
 id halow-ui >/dev/null 2>&1 || sudo useradd -r -s /usr/sbin/nologin -G systemd-journal halow-ui
-# Never clobber live operator state (profile/SSID/mode edits) on redeploy
-[ -f /etc/halow/halow.env ] || sudo install -m600 -o root /tmp/halow-deploy/halow.env /etc/halow/
+# Never clobber live operator state (profile/SSID/mode edits) on redeploy.
+# Group halow-ui: the console reads SSID/profile/mode from this file.
+[ -f /etc/halow/halow.env ] || sudo install -m640 -o root -g halow-ui /tmp/halow-deploy/halow.env /etc/halow/
+sudo chgrp halow-ui /etc/halow/halow.env && sudo chmod 640 /etc/halow/halow.env
 # ui.conf and nodes.json are read by the unprivileged UI user
 sudo install -m640 -o root -g halow-ui /tmp/halow-deploy/ui.conf /tmp/halow-deploy/nodes.json /etc/halow/
 rm -rf /tmp/halow-deploy
