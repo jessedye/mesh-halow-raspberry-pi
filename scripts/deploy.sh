@@ -7,7 +7,7 @@
 # echoed or committed; everything sensitive moves over ssh only.
 set -euo pipefail
 
-PI=${PI:-pi@192.168.51.201}
+PI=${PI:-pi@192.168.51.202}
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 MESH_SECRETS=${MESH_SECRETS:-$HOME/Desktop/mesh-v4/config/secrets.env}
 

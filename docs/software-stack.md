@@ -7,7 +7,7 @@ them together, not individually.
 
 - Raspberry Pi 4 Model B Rev 1.5 (8 GB), Raspberry Pi OS Lite 64-bit
   (Trixie, 2026-06-18 image), kernel `6.18.39+rpt-rpi-v8`.
-- Gateway node: `192.168.51.201/23` static on eth0, user `pi`.
+- Gateway node: `192.168.51.202/23` static on eth0, user `pi`.
 
 ## Kernel status — read before upgrading anything
 

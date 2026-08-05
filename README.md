@@ -25,14 +25,14 @@ giving the mesh-v4 transport ladder its HaLow rung.
 ## Gateway node
 
 - Pi 4B Rev 1.5 (8 GB), Pi OS Lite 64-bit Trixie, kernel 6.18.39+rpt-rpi-v8
-- `192.168.51.201/23` static on eth0 (gw 192.168.50.1, DNS 1.1.1.1/8.8.8.8), user `pi`
+- `192.168.51.202/23` static on eth0 (gw 192.168.50.1, DNS 1.1.1.1/8.8.8.8), user `pi`
 - HT-HC01P wired per `docs/wiring.md` (Morse HAT-compatible map)
 
 ## Quick start (fresh Pi)
 
 ```sh
-scp -r . pi@192.168.51.201:mesh-halow-raspberry-pi
-ssh pi@192.168.51.201
+scp -r . pi@192.168.51.202:mesh-halow-raspberry-pi
+ssh pi@192.168.51.202
 cd mesh-halow-raspberry-pi && ./scripts/install.sh
 sudo reboot
 ./scripts/verify.sh

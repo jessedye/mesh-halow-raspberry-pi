@@ -1,6 +1,6 @@
 # HT-HC01P (WiFi HaLow, Morse Micro MM6108) → Raspberry Pi 4 wiring
 
-As-built 2026-08-05 on the Pi 4 gateway (`192.168.51.201`). This is the same
+As-built 2026-08-05 on the Pi 4 gateway (`192.168.51.202`). This is the same
 GPIO assignment as Morse Micro's own Pi HAT (MMECH06 / EKH01 eval kits) —
 Heltec copied their map, so Morse's stock `mm610x-spi` device-tree overlay
 matches this wiring with no edits.
