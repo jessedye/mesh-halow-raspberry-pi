@@ -1,0 +1,41 @@
+--- a/spi.c
++++ b/spi.c
+@@ -14,6 +14,7 @@
+ #include <linux/crc-itu-t.h>
+ #include <linux/spi/spi.h>
+ #include <linux/gpio.h>
++#include <linux/gpio/consumer.h>
+ 
+ #include "morse.h"
+ #include "debug.h"
+@@ -287,6 +288,30 @@
+ static void morse_spi_initsequence(struct morse_spi *mspi)
+ {
+ 	struct spi_device *spi = mspi->spi;
++#if KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE
++	struct gpio_desc *cs_gpiod = spi_get_csgpiod(spi, 0);
++
++	/*
++	 * Unpatched kernels ignore SPI_CS_HIGH for GPIO-descriptor chip
++	 * selects (polarity comes from the DT flag), so the CS_HIGH path
++	 * below clocks the training bytes with CS *asserted* and the chip
++	 * never leaves its pre-SPI state. With SPI_NO_CS the core leaves the
++	 * line alone entirely; parking it logically inactive yields the
++	 * required >=74 clocks with both CS and MOSI high.
++	 */
++	spi->mode |= SPI_NO_CS;
++	if (cs_gpiod && spi_setup(spi) == 0) {
++		gpiod_set_value_cansleep(cs_gpiod, 0);
++		memset(mspi->data, 0xFF, MM610X_BUF_SIZE);
++		morse_spi_xfer(mspi, 18);
++
++		spi->mode &= ~SPI_NO_CS;
++		if (spi_setup(spi) != 0)
++			dev_err(&spi->dev, "can't restore chip-select mode\n");
++		return;
++	}
++	spi->mode &= ~SPI_NO_CS;
++#endif
+ 
+ 	spi->mode |= SPI_CS_HIGH;
+ 	if (spi_setup(spi) != 0) {
