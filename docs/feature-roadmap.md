@@ -87,3 +87,18 @@ UI/API, recovery — but the clients set a higher bar in three areas:
   nodes' delay-tolerant job.
 - **GPS/track features** — the gateway is stationary infrastructure.
 - **PKI nodedb machinery** — WPA3-SAE + the nodes' own PKI covers it.
+
+## Diagnostic tools (added 2026-08-05, prioritized)
+
+| Pri | Tool | Motivating lesson |
+|---|---|---|
+| 1 | Ping suite (`/api/diag/ping`: per-probe results, spread, loss) | small-n loss is not a rate |
+| 1 | Neighbor/ARP view with states | "associated but answers no ARP" trap |
+| 1 | One-shot diag bundle (`/api/diag` gathering everything) | the nodes' most-used endpoint |
+| 2 | TCP service check via HTTP HEAD (never bare connects) | bare :443 connects crashed nodes |
+| 2 | Channel utilization (`iw survey dump`) | LoRa co-sited in 902–928 |
+| 2 | morse_cli chip counters via API | confirm at the receiver |
+| 2 | Undervoltage/throttle decode + history | two boards browned out on this bench |
+| 3 | conntrack flow view, nft rule hit counters | "is traffic hitting this rule" |
+| 3 | DNS resolution check | resolver misconfig looks like an outage |
+| 3 | Service flap counters (systemd NRestarts) | quiet hourly restarts are invisible |
