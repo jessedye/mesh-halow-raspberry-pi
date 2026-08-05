@@ -1,0 +1,12 @@
+[Unit]
+Description=Capture HaLow chip details on first appearance
+BindsTo=sys-subsystem-net-devices-halow0.device
+After=sys-subsystem-net-devices-halow0.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/halow-first-contact.sh
+
+[Install]
+WantedBy=sys-subsystem-net-devices-halow0.device
