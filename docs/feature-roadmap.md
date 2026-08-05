@@ -186,7 +186,19 @@ nothing on the v1 rejected list); verifier corrections are folded in.
     skip GPS-log pruning, fill flash). Add `local stratum 10`, verify
     driftfile/fake-hwclock present, expose time_sync (real vs holdover,
     last-sync age) in /api/system + Overview. [small/medium]
-22. **Storage discipline DEFECT** — halow-mon rewrites stations.jsonl,
+22. **Storage discipline DEFECT** — DONE 2026-08-05 (both defect modes
+    reproduced on the OLD code first [M]: truncated state -> silent
+    counter reset; valid-partial state + AP down -> KeyError wedging the
+    healer at the exact moment healing was needed. Fix: atomic_write
+    (tmp+fsync+replace) at all three rewrite sites, defaults-merge
+    load_state, logrotate drop-in, journald 100M/32M caps (8M in use),
+    disk low-water sampling with edge-triggered events — verified exactly
+    one event across two crossing runs, recovery edge after restore.
+    20-run torn-file watch: zero observations, no tmp litter; ring prune
+    exact at 2880 with the fresh sample as tail; /api/system disk within
+    0.002%% of df. Appends stay appends by design — torn trailing lines
+    are reader-tolerated and rewrites would multiply SD wear.) —
+    halow-mon rewrites stations.jsonl,
     metrics.jsonl, and mon-state.json in place with open(w) every minute;
     mon-state.json is the self-healer's own state, so a brownout mid-write
     can wedge the healing loop itself. tmp+os.replace atomic writes

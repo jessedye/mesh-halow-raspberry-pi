@@ -568,6 +568,7 @@ EVENTS_LOG = "/var/lib/halow/station-events.log"
 LOG_UNITS = ("halow-ap", "halow-net", "halow-ui", "halow-sta-events",
              "halow-join-watch", "halow-iperf3", "dnsmasq", "kernel")
 JOIN_STATE_DIR = "/var/lib/halow/join"
+DISK_LOW_MB = 512  # SD low-water; mirrored in scripts/halow-mon
 
 
 @app.post("/api/halow/throughput")
@@ -925,13 +926,19 @@ def api_metrics():
         pass
     summary = {}
     if samples:
-        for k in ("temp_c", "load1", "mem_avail_kb", "stations"):
+        for k in ("temp_c", "load1", "mem_avail_kb", "stations",
+                  "disk_free_mb"):
             vals = [s[k] for s in samples if k in s]
-            summary[k] = {"min": min(vals), "max": max(vals),
-                          "now": vals[-1]}
+            if vals:
+                summary[k] = {"min": min(vals), "max": max(vals),
+                              "now": vals[-1]}
         # low-water mark is the value that means something (bench lesson)
         summary["mem_low_water_kb"] = min(
             s["mem_avail_kb"] for s in samples)
+        disk_vals = [s["disk_free_mb"] for s in samples
+                     if "disk_free_mb" in s]
+        if disk_vals:
+            summary["disk_free_low_water_mb"] = min(disk_vals)
         summary["uptime_pct"] = {
             k: round(100 * sum(1 for s in samples if s.get(k)) /
                      len(samples), 1)
@@ -1037,13 +1044,20 @@ def api_system():
         k, v = line.split(":", 1)
         if k in ("MemTotal", "MemAvailable"):
             mem[k] = v.strip()
+    # DISK_LOW_MB mirrored in scripts/halow-mon (the sampler's copy)
+    vfs = os.statvfs("/")
+    total_mb = vfs.f_blocks * vfs.f_frsize // 1048576
+    free_mb = vfs.f_bavail * vfs.f_frsize // 1048576
     return jsonify({
         "uptime": sh("uptime -p").strip(),
         "load": open("/proc/loadavg").read().split()[:3],
         "mem": mem,
         "temp": sh("cat /sys/class/thermal/thermal_zone0/temp").strip(),
         "kernel": sh("uname -r").strip(),
-        "disk": sh("df -h / | tail -1").split(),
+        "disk": {"total_mb": total_mb, "free_mb": free_mb,
+                 "used_pct": round(100 * (1 - free_mb / total_mb), 1)
+                 if total_mb else 0,
+                 "low": free_mb < DISK_LOW_MB, "low_water_mb": DISK_LOW_MB},
     })
 
 
@@ -1309,7 +1323,7 @@ async function ovw(){const s=await j("/api/system"),h=await j("/api/halow");
  <div class="stat"><div class="v ${h.present?'ok':'bad'}">${h.present?"present":"ABSENT"}</div><div class="k">halow0</div></div>
  <div class="stat"><div class="v ${h.ap_active==='active'?'ok':'warn'}">${esc(h.ap_active)}</div><div class="k">AP service</div></div>
  </div></div>
- <div class="card"><h2>kernel / disk</h2><pre>${esc(s.kernel)}  root ${esc((s.disk[3]||"?"))} free</pre></div>
+ <div class="card"><h2>kernel / disk</h2><pre>${esc(s.kernel)}  root <span class="${s.disk.low?'bad':'ok'}">${s.disk.free_mb} MB free</span> of ${s.disk.total_mb} MB (${s.disk.used_pct}% used)${s.disk.low?' — BELOW '+s.disk.low_water_mb+' MB LOW-WATER':''}</pre></div>
  ${await monCard()}`}
 async function monCard(){try{const m=await j("/api/metrics?minutes=1440");
  if(!m.n)return `<div class="card"><h2>monitor (24h)</h2><p class="warn">no samples yet</p></div>`;
@@ -1318,6 +1332,7 @@ async function monCard(){try{const m=await j("/api/metrics?minutes=1440");
  <div class="grid">
  <div class="stat"><div class="v">${s.temp_c.now}°C</div><div class="k">temp (${s.temp_c.min}–${s.temp_c.max})</div></div>
  <div class="stat"><div class="v">${Math.round(s.mem_low_water_kb/1024)} MB</div><div class="k">mem low-water</div></div>
+ <div class="stat"><div class="v">${s.disk_free_low_water_mb!=null?s.disk_free_low_water_mb+" MB":"—"}</div><div class="k">disk low-water</div></div>
  <div class="stat"><div class="v">${s.uptime_pct.ap}%</div><div class="k">AP beaconing</div></div>
  <div class="stat"><div class="v">${s.uptime_pct.upstream}%</div><div class="k">upstream reachable</div></div>
  <div class="stat"><div class="v">${(mo.ap_restarts||0)+(mo.dnsmasq_restarts||0)+(mo.eth0_bounces||0)}</div><div class="k">heal actions (ap ${mo.ap_restarts||0} / dns ${mo.dnsmasq_restarts||0} / eth0 ${mo.eth0_bounces||0})</div></div>

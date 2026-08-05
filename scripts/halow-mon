@@ -17,6 +17,12 @@ METRICS = os.path.join(STATE_DIR, "metrics.jsonl")
 STATE = os.path.join(STATE_DIR, "mon-state.json")
 RING_LINES = 2880  # 2 days at 1/min
 UPSTREAM = "192.168.50.1"
+DISK_LOW_MB = 512  # SD low-water; mirrored in halow_ui.py
+
+DEFAULTS = {"ap_restarts": 0, "dnsmasq_restarts": 0, "eth0_bounces": 0,
+            "ap_down_streak": 0, "upstream_down_streak": 0,
+            "last_eth0_bounce": 0, "disk_low": False, "disk_low_events": 0,
+            "actions": []}
 
 
 def sh(cmd, timeout=15):
@@ -27,13 +33,27 @@ def sh(cmd, timeout=15):
         return ""
 
 
+def atomic_write(path, data, mode=0o644):
+    """tmp in same dir + fsync + os.replace — a brownout mid-write leaves
+    the OLD file intact, never a truncated one (meshdata.py convention;
+    fsync added because the threat here is power loss, not process crash).
+    The tmp MUST be a sibling: os.replace across filesystems is EXDEV."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, mode)  # mode set BEFORE it becomes the live file
+    os.replace(tmp, path)
+
+
 def load_state():
+    # defaults-merge: a torn-but-valid partial file must never KeyError
+    # the healer; a corrupt file falls back whole.
     try:
-        return json.load(open(STATE))
+        return {**DEFAULTS, **json.load(open(STATE))}
     except Exception:
-        return {"ap_restarts": 0, "dnsmasq_restarts": 0, "eth0_bounces": 0,
-                "ap_down_streak": 0, "upstream_down_streak": 0,
-                "last_eth0_bounce": 0, "actions": []}
+        return dict(DEFAULTS)
 
 
 def act(state, key, note):
@@ -85,6 +105,8 @@ def main():
 
     # --- sample ---
     thr = sh("vcgencmd get_throttled")
+    vfs = os.statvfs("/")
+    free_mb = vfs.f_bavail * vfs.f_frsize // 1048576
     sample = {
         "t": now,
         "load1": float(open("/proc/loadavg").read().split()[0]),
@@ -94,8 +116,16 @@ def main():
                              open("/proc/meminfo") if "MemAvailable" in x),
         "throttled": thr.split("=")[-1] if "=" in thr else None,
         "stations": sh("iw dev halow0 station dump").count("Station"),
+        "disk_free_mb": free_mb,
         "ap": ap_beaconing, "dnsmasq": dnsmasq_ok, "upstream": upstream_ok,
     }
+    # disk low-water: edge-triggered — one logged event per crossing,
+    # never one per minute
+    low = free_mb < DISK_LOW_MB
+    if low and not st.get("disk_low"):
+        act(st, "disk_low_events",
+            f"disk free {free_mb}MB below {DISK_LOW_MB}MB low-water")
+    st["disk_low"] = low
     with open(METRICS, "a") as f:
         f.write(json.dumps(sample) + "\n")
 
@@ -127,7 +157,7 @@ def main():
         try:
             lines = open(stations_log).readlines()
             if len(lines) > RING_LINES * 4:
-                open(stations_log, "w").writelines(lines[-RING_LINES * 2:])
+                atomic_write(stations_log, "".join(lines[-RING_LINES * 2:]))
         except OSError:
             pass
         os.chmod(stations_log, 0o644)
@@ -136,13 +166,12 @@ def main():
     try:
         lines = open(METRICS).readlines()
         if len(lines) > RING_LINES + 200:
-            open(METRICS, "w").writelines(lines[-RING_LINES:])
+            atomic_write(METRICS, "".join(lines[-RING_LINES:]))
     except OSError:
         pass
     os.chmod(METRICS, 0o644)
 
-    json.dump(st, open(STATE, "w"))
-    os.chmod(STATE, 0o644)
+    atomic_write(STATE, json.dumps(st))
 
 
 if __name__ == "__main__":

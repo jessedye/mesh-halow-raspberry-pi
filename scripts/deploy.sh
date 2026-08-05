@@ -60,6 +60,11 @@ rm -rf /tmp/halow-deploy
 sudo install -m644 config/halow-profiles.json config/pinned-scan.json config/nftables-halow.conf /etc/halow/
 sudo install -m644 config/dnsmasq-halow.conf /etc/dnsmasq.d/halow.conf
 sudo install -m644 config/chrony-halow.conf /etc/chrony/conf.d/halow.conf
+sudo install -m644 config/logrotate-halow /etc/logrotate.d/halow
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo install -m644 config/journald-halow.conf /etc/systemd/journald.conf.d/halow.conf
+sudo systemctl restart systemd-journald
+sudo journalctl --vacuum-size=100M >/dev/null 2>&1 || true
 sudo sed -i "s/^#host-name=.*/host-name=halow-gw/" /etc/avahi/avahi-daemon.conf
 sudo install -m644 config/99-halow-unmanaged.conf /etc/NetworkManager/conf.d/
 sudo install -m644 config/99-halow-net.rules /etc/udev/rules.d/

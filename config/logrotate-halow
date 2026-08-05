@@ -1,0 +1,24 @@
+# /etc/logrotate.d/halow — size caps for the gateway's append-only logs.
+# Bound math: worst case with the health ladder (#18) landed is ~10
+# classified events/min x ~80 B x 1440 min = ~1.1 MB/day; daily logrotate
+# + maxsize 1M caps the live file near 2 MB, 1 live + 3 rotated = ~5 MB
+# ceiling. [C - projection; measure at first real cadence.]
+# 'create' (not copytruncate) is safe ONLY because halow-sta-events opens
+# the log per event and exits; a future long-lived writer holding the fd
+# must switch this stanza to copytruncate.
+/var/lib/halow/station-events.log {
+    maxsize 1M
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 halow-ui halow-ui
+}
+/var/lib/halow/throughput.jsonl {
+    maxsize 256k
+    rotate 2
+    missingok
+    notifempty
+    create 0644 halow-ui halow-ui
+}
