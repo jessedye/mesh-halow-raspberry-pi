@@ -58,9 +58,25 @@ constant 0xFF:
 - Yet no byte the module sends ever appears on the Pi's MISO (pull-follow
   0xFF at every clock rate).
 
-Elimination leaves one topology: **the data pair is crossed — swap the
-wires at Pi header pins 19 and 21.** This mirrors the node2 incident on
-the ESP32 bench, where the same cross produced the same perfect silence.
+Elimination first suggested a crossed data pair. **The swap disproved
+that** (2026-08-05 12:14): with the two data wires exchanged, the module
+stopped reacting to probe traffic entirely — no IRQ rise at all, where the
+original arrangement always produced one. A crossed-but-healthy pair
+cannot produce that asymmetry; a **dead wire** produces exactly it:
+
+- Original position (Pi pin 21, MISO role): commands still reached the
+  module on the good wire (IRQ reacted), replies died on the dead one.
+- Swapped position (Pi pin 19, MOSI role): commands die on the dead wire,
+  module hears nothing, zero reaction.
+
+**Verdict: the jumper originally at Pi pin 21 (module pad 47) is broken —
+bad conductor, bad crimp, or cold joint at the module pad.** Fix: restore
+the original arrangement and replace that wire (or both data jumpers)
+with fresh ones; if it persists, continuity-beep Pi pin 21 ↔ module pad
+47 and reflow the pad-47 joint. The wire-census asymmetry (IRQ reacts vs
+not) is the discriminator between a crossed pair and a dead wire — the
+ESP32 bench never had this test, which is why its cross diagnosis
+transferred here too eagerly.
 
 ## Traps already paid for on the ESP32 bring-up (do not rediscover)
 
