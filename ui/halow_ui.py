@@ -1587,6 +1587,21 @@ def _probe(addr, deadline):
     return r
 
 
+@app.get("/api/topology")
+@authed
+def api_topology():
+    """Unified mesh graph built by halow-watch from every evidence
+    source (gateway-side halow/wifi/ethernet + each node's LoRa/ESP-NOW
+    peer graph). A file read — costs the nodes nothing."""
+    try:
+        topo = json.load(open("/var/lib/halow/topology.json"))
+    except Exception:
+        return jsonify({"nodes": [], "edges": [], "error":
+                        "no topology yet — is halow-watch running?"})
+    topo["age_s"] = max(0, int(time.time() - topo.get("t", 0)))
+    return jsonify(topo)
+
+
 @app.get("/api/role")
 @authed
 def api_role():
@@ -1884,7 +1899,7 @@ border-radius:6px;padding:5px 8px;font:inherit;width:110px}
 <a href="/logout" style="color:var(--dim);margin-left:14px;text-decoration:none">logout</a></header>
 <main id="main"></main>
 <script>
-const TABS=["Overview","HaLow","Router","Config","Nodes","Diag","Debug"];let tab="Overview";
+const TABS=["Overview","HaLow","Router","Config","Nodes","Map","Diag","Debug"];let tab="Overview";
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 async function j(u,opt){const r=await fetch(u,opt);if(!r.ok)throw new Error(r.status);return r.json()}
@@ -1897,6 +1912,7 @@ async function render(){nav();const m=$("#main");m.innerHTML="<p class='warn'>lo
  else if(tab==="Config")m.innerHTML=await config();
  else if(tab==="Debug")m.innerHTML=await debug();
  else if(tab==="Diag")m.innerHTML=await diag();
+ else if(tab==="Map"){m.innerHTML=await meshmap();drawMesh()}
  else m.innerHTML=await nodes();}catch(e){m.innerHTML=`<p class="bad">${esc(e)}</p>`}}
 async function diag(){const nb=await j("/api/diag/neigh"),sv=await j("/api/diag/survey"),pw=await j("/api/diag/power");
  let bo={count:0,active:false};try{bo=await j("/api/diag/brownouts")}catch(e){}
@@ -2225,6 +2241,48 @@ async function router(){const r=await j("/api/router");
  <table><tr><th>host</th><th>ip</th><th>mac</th></tr>${ls}</table></div>
  <div class="card"><h2>firewall / NAT</h2><pre>${esc(r.nft)}</pre></div>
  <div class="card"><h2>routes</h2><pre>${esc(r.routes.map(x=>`${x.dst||"default"} via ${x.gateway||"-"} dev ${x.dev}`).join("\n"))}</pre></div>`}
+const TCOLOR={halow:"#4ea1ff",wifi:"#39d353",ethernet:"#c9a227",lora:"#e5534b",espnow:"#a371f7"};
+let _mesh=null;
+async function meshmap(){_mesh=await j("/api/topology");
+ const leg=Object.entries(TCOLOR).map(([k,c])=>
+  `<span style="color:${c}">■</span> ${k}`).join(" &nbsp; ");
+ return `<div class="card"><h2>mesh map — ${_mesh.nodes?_mesh.nodes.length:0} nodes,
+  ${_mesh.edges?_mesh.edges.length:0} links${_mesh.age_s!=null?` · ${_mesh.age_s}s old`:""}
+  ${_mesh.error?`<span class="warn">${esc(_mesh.error)}</span>`:""}</h2>
+ <p style="color:var(--dim)">${leg} — solid = the router's own view (HaLow assoc / WiFi lease /
+  wired); dashed = a node's reported peer (LoRa/ESP-NOW mesh). Hover a link for detail.</p>
+ <svg id="mesh-svg" viewBox="0 0 900 520" style="width:100%;height:520px;background:#0d1117;border-radius:8px"></svg>
+ <pre id="mesh-detail" style="color:var(--dim)"></pre></div>`}
+function drawMesh(){const svg=$("#mesh-svg");if(!svg||!_mesh||!_mesh.nodes)return;
+ const W=900,H=520,V=_mesh.nodes,E=_mesh.edges||[];
+ const idx={};V.forEach((v,i)=>idx[v.id]=i);
+ // seed: router centre, others on a circle, then a few relaxation passes
+ const P=V.map((v,i)=>v.id==="router"?{x:W/2,y:H/2}:
+  {x:W/2+260*Math.cos(2*Math.PI*i/V.length),y:H/2+200*Math.sin(2*Math.PI*i/V.length)});
+ for(let it=0;it<220;it++){
+  const F=P.map(()=>({x:0,y:0}));
+  for(let a=0;a<V.length;a++)for(let b=a+1;b<V.length;b++){
+   let dx=P[a].x-P[b].x,dy=P[a].y-P[b].y,d=Math.hypot(dx,dy)||1,f=9000/(d*d);
+   F[a].x+=dx/d*f;F[a].y+=dy/d*f;F[b].x-=dx/d*f;F[b].y-=dy/d*f}
+  E.forEach(e=>{const a=idx[e.from],b=idx[e.to];if(a==null||b==null)return;
+   let dx=P[b].x-P[a].x,dy=P[b].y-P[a].y,d=Math.hypot(dx,dy)||1,f=(d-150)*0.02;
+   F[a].x+=dx/d*f;F[a].y+=dy/d*f;F[b].x-=dx/d*f;F[b].y-=dy/d*f});
+  for(let i=0;i<V.length;i++){if(V[i].id==="router"){P[i].x=W/2;P[i].y=H/2;continue}
+   P[i].x=Math.max(40,Math.min(W-40,P[i].x+F[i].x*0.05));
+   P[i].y=Math.max(40,Math.min(H-40,P[i].y+F[i].y*0.05))}}
+ const scls=s=>s==="healthy"?"#39d353":s==="down"?"#e5534b":s?"#d29922":"#8b949e";
+ let s="";
+ E.forEach((e,i)=>{const a=P[idx[e.from]],b=P[idx[e.to]];if(!a||!b)return;
+  const rev=(e.evidence||"").includes("/api/mesh");
+  s+=`<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${TCOLOR[e.transport]||'#8b949e'}"
+   stroke-width="2.5"${rev?' stroke-dasharray="6 4"':''} opacity="0.8"
+   onmouseover="document.getElementById('mesh-detail').textContent='${esc(e.from)} — ${esc(e.to)} via ${esc(e.transport)}: ${esc(e.detail||'')} [${esc(e.evidence||'')}]'"/>`});
+ V.forEach((v,i)=>{const p=P[i],r=v.kind==="gateway"?26:v.kind==="heard"?12:18;
+  const fill=v.kind==="gateway"?"#1f6feb":v.kind==="heard"?"#30363d":"#21262d";
+  const batt=v.battery!=null?` ${v.battery}%`:"";
+  s+=`<circle cx="${p.x}" cy="${p.y}" r="${r}" fill="${fill}" stroke="${scls(v.state)}" stroke-width="2.5"/>
+   <text x="${p.x}" y="${p.y+r+14}" fill="#c9d1d9" font-size="12" text-anchor="middle">${esc(v.label||v.id)}${esc(batt)}</text>`});
+ svg.innerHTML=s}
 async function roleOp(op,confirm){const fd=new FormData();fd.append("op",op);
  if(confirm)fd.append("confirm","1");
  const r=await(await fetch("/api/config/role",{method:"POST",body:fd})).json();

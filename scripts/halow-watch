@@ -32,6 +32,7 @@ import urllib.request
 STATE_DIR = "/var/lib/halow"
 CACHE = os.path.join(STATE_DIR, "nodewatch.json")
 HISTORY = os.path.join(STATE_DIR, "nodewatch-history.jsonl")
+TOPOLOGY = os.path.join(STATE_DIR, "topology.json")
 NODES = "/etc/halow/nodes.json"
 ENVF = "/etc/halow/halow.env"
 RESERVATIONS = "/etc/dnsmasq.d/halow-reservations.conf"
@@ -305,6 +306,33 @@ def poll_cycle(states, cfg, now):
                     st.learned["last_diag_at"] = now
                 if isinstance(settings, dict):
                     st.interval = learned_interval(settings)
+                # mesh peer graph for the topology map: edges[] carry
+                # from/to (meshtastic ids), via (lora/espnow/wifi), snr,
+                # state; nodes[] carry id->name labels
+                _, mesh = fetch(n["url"] + "/api/mesh", n.get("token"))
+                if isinstance(mesh, dict):
+                    md = mesh.get("data", mesh)
+                    st.learned["mesh_edges"] = [
+                        {"from": e.get("from"), "to": e.get("to"),
+                         "via": e.get("via"), "snr": e.get("snr"),
+                         "state": e.get("state"),
+                         "usable": e.get("usable"),
+                         "age_sec": e.get("age_sec")}
+                        for e in (md.get("edges") or [])
+                        if e.get("from") and e.get("to")]
+                    names = {}
+                    for mn in (md.get("nodes") or []):
+                        if mn.get("id"):
+                            names[mn["id"]] = (mn.get("short_name")
+                                               or mn.get("long_name")
+                                               or mn["id"])
+                            if mn.get("is_self"):
+                                st.learned["long_name"] = mn.get("long_name")
+                                # the reliable name<->meshtastic-id link
+                                st.learned["id"] = mn["id"]
+                    st.learned["mesh_names"] = names
+                    espn = md.get("espnow") or {}
+                    st.learned["espnow_ready"] = espn.get("ready")
             except Exception:
                 entry["alerts"].append("deep poll failed; cheap path fine")
 
@@ -341,6 +369,94 @@ def poll_cycle(states, cfg, now):
     return out_nodes, unknown
 
 
+def build_topology(states, nodes, signals, leases, reservations, now):
+    """Unified mesh graph from every evidence source. Vertices: the router
+    + each managed node + any meshtastic id a node hears but we don't
+    manage. Edges: router<->node (halow assoc / wlan lease / LAN url,
+    gateway-side evidence) and node<->node (each node's /api/mesh edges,
+    LoRa/ESP-NOW). Node ids are correlated to names via learned mesh_names."""
+    verts = {"router": {"id": "router", "label": "halow-gw",
+                        "kind": "gateway", "transports": ["ethernet"]}}
+    id_to_name = {}   # meshtastic id -> our node name
+    for n in nodes:
+        name = n.get("name", "?")
+        st = states.get(name)
+        learned = st.learned if st else {}
+        mid = learned.get("id")
+        if mid:
+            id_to_name[mid] = name
+        verts[name] = {
+            "id": name, "label": name, "kind": "node",
+            "mesh_id": mid, "long_name": learned.get("long_name"),
+            "battery": learned.get("battery_pct"),
+            "state": next((o["state"] for o in []), None),
+            "transports": []}
+    edges = []
+    seen_edge = set()
+
+    def add_edge(a, b, transport, detail, evidence):
+        key = tuple(sorted([a, b])) + (transport,)
+        if key in seen_edge:
+            return
+        seen_edge.add(key)
+        edges.append({"from": a, "to": b, "transport": transport,
+                      "detail": detail, "evidence": evidence})
+        for v in (a, b):
+            if v in verts and transport not in verts[v]["transports"]:
+                verts[v]["transports"].append(transport)
+
+    # router <-> node, gateway-side evidence
+    for n in nodes:
+        name = n.get("name", "?")
+        mac = (n.get("mac") or "").lower()
+        # halow association (with the gateway's own signal reading)
+        if mac and mac in signals:
+            sig = signals.get(mac)
+            add_edge("router", name, "halow",
+                     f"{sig} dBm" if sig is not None else "associated",
+                     "iw station dump")
+        # 2.4GHz mesh-2g lease (wlan0, 10.42.x)
+        if mac and leases.get(mac, {}).get("ip", "").startswith("10.42."):
+            add_edge("router", name, "wifi",
+                     leases[mac]["ip"], "wlan0 lease")
+        # LAN url on the wired side
+        host = n.get("url", "").split("://", 1)[-1].split("/", 1)[0]\
+            .split(":", 1)[0]
+        if host.startswith(("192.168.50.", "192.168.51.")):
+            add_edge("router", name, "ethernet", host, "nodes.json url")
+
+    # node <-> node, from each node's mesh peer graph
+    for n in nodes:
+        name = n.get("name", "?")
+        st = states.get(name)
+        if not st:
+            continue
+        names = st.learned.get("mesh_names", {})
+        for e in st.learned.get("mesh_edges", []):
+            a = id_to_name.get(e["from"])
+            b = id_to_name.get(e["to"])
+            # a heard id we don't manage becomes its own vertex
+            for raw, mapped in ((e["from"], a), (e["to"], b)):
+                if mapped is None and raw not in verts:
+                    verts[raw] = {"id": raw, "kind": "heard",
+                                  "label": names.get(raw, raw[:9]),
+                                  "transports": []}
+            va = a or e["from"]
+            vb = b or e["to"]
+            via = (e.get("via") or "lora").lower()
+            snr = e.get("snr")
+            age = e.get("age_sec")
+            detail = (f"SNR {snr}" if snr is not None else "") + \
+                     (f" · heard {age}s ago" if age is not None else "")
+            if e.get("state") and e["state"] != "established":
+                detail += f" ({e['state']})"
+            add_edge(va, vb, via, detail.strip(" ·"),
+                     f"{name} /api/mesh")
+
+    # merge live health state onto node vertices
+    return {"t": now, "nodes": list(verts.values()), "edges": edges}
+
+
 def main():
     os.makedirs(STATE_DIR, exist_ok=True)
     states = {}
@@ -352,6 +468,15 @@ def main():
             cache = {"t": int(start), "interval_s": cfg["interval"],
                      "nodes": nodes_out, "unknown_stations": unknown}
             atomic_write(CACHE, json.dumps(cache, indent=1))
+            # topology map (roadmap-adjacent, user request): unified graph
+            topo = build_topology(states, load_nodes(), station_signals(),
+                                  load_leases(), load_reservations(),
+                                  int(start))
+            state_by = {n["name"]: n["state"] for n in nodes_out}
+            for v in topo["nodes"]:
+                if v["id"] in state_by:
+                    v["state"] = state_by[v["id"]]
+            atomic_write(TOPOLOGY, json.dumps(topo, indent=1))
             with open(HISTORY, "a") as f:
                 for n in nodes_out:
                     f.write(json.dumps({"t": int(start), "name": n["name"],
