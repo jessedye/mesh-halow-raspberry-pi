@@ -34,7 +34,10 @@ print(hashlib.pbkdf2_hmac("sha256",sys.argv[2].encode(),bytes.fromhex(sys.argv[1
 PY
 )
 SESSION_SECRET=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
-printf 'AUTH_SALT=%s\nAUTH_HASH=%s\nAUTH_ITER=100000\nSESSION_SECRET=%s\n' "$SALT" "$HASH" "$SESSION_SECRET" > "$T/ui.conf"
+# Bearer token for the config API = the mesh-v4 ADMIN_TOKEN; only its hash ships
+API_TOKEN_HASH=$(printf '%s' "$ADMIN_TOKEN" | sha256sum | cut -d" " -f1)
+printf 'AUTH_SALT=%s\nAUTH_HASH=%s\nAUTH_ITER=100000\nSESSION_SECRET=%s\nAPI_TOKEN_HASH=%s\n' \
+  "$SALT" "$HASH" "$SESSION_SECRET" "$API_TOKEN_HASH" > "$T/ui.conf"
 sed -e "s|CHANGE-ME|${ADMIN_TOKEN}|g" "$REPO/config/nodes.json.example" > "$T/nodes.json"
 scp -q "$T/halow.env" "$T/ui.conf" "$T/nodes.json" "$PI:/tmp/halow-deploy/" 2>/dev/null || {
   ssh "$PI" 'mkdir -p /tmp/halow-deploy && chmod 700 /tmp/halow-deploy'

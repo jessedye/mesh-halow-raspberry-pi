@@ -92,7 +92,13 @@ def verify_creds(user_pass):
 
 
 def check_auth(header):
-    """Basic auth stays valid for curl/scripts alongside browser sessions."""
+    """Basic auth and Bearer tokens stay valid for curl/scripts alongside
+    browser sessions. The Bearer token is the mesh-v4 ADMIN_TOKEN; only its
+    sha256 is stored (ui.conf API_TOKEN_HASH), mirroring the nodes' model."""
+    if header.startswith("Bearer "):
+        want = load_kv(UI_CONF).get("API_TOKEN_HASH", "")
+        got = hashlib.sha256(header[7:].strip().encode()).hexdigest()
+        return bool(want) and hmac.compare_digest(got, want)
     if not header.startswith("Basic "):
         return False
     try:
@@ -258,6 +264,163 @@ def api_router_wifi_ap():
     return jsonify({"state": state, "output": out})
 
 
+# ---------- Router configuration ----------
+# Every mutation shells to halowctl (the audited sudo surface) and is
+# reachable identically from the UI and from curl with Basic/Bearer auth.
+
+def halowctl(args, stdin=None, timeout=40):
+    try:
+        r = subprocess.run(["sudo", "/usr/local/bin/halowctl"] + args,
+                           input=stdin, capture_output=True, text=True,
+                           timeout=timeout)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return False, str(e)
+
+
+@app.get("/api/config")
+@authed
+def api_config():
+    env = load_kv(ENV_CONF)
+    dhcp_raw = ""
+    try:
+        dhcp_raw = open("/etc/dnsmasq.d/halow.conf").read()
+    except OSError:
+        pass
+    import re as _re
+    rng = _re.search(r"dhcp-range=([\d.]+),([\d.]+),(\S+)", dhcp_raw)
+    dns = _re.search(r"option:dns-server,(\S+)", dhcp_raw)
+    forwards = []
+    try:
+        forwards = json.load(open("/etc/halow/forwards.json"))
+    except Exception:
+        pass
+    wifi = {}
+    for line in sh("nmcli -t -f 802-11-wireless.ssid,802-11-wireless.channel con show mesh-2g").splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            wifi[k.rsplit(".", 1)[-1]] = v
+    return jsonify({
+        "halow": {
+            "ssid": env.get("HALOW_SSID"),
+            "passphrase_set": bool(env.get("HALOW_PASSPHRASE")),
+            "mode": env.get("HALOW_MODE", "ap"),
+            "profile": env.get("HALOW_PROFILE"),
+            "channel_override": env.get("HALOW_CHANNEL", ""),
+            "width_override": env.get("HALOW_WIDTH", ""),
+        },
+        "wifi": {
+            "ssid": wifi.get("ssid", ""),
+            "channel": wifi.get("channel", ""),
+            "active": bool(sh("nmcli -t -f NAME con show --active | grep -x mesh-2g")),
+        },
+        "dhcp": {
+            "start": rng.group(1) if rng else "",
+            "end": rng.group(2) if rng else "",
+            "lease": rng.group(3) if rng else "",
+            "dns": dns.group(1) if dns else "",
+        },
+        "forwards": forwards,
+    })
+
+
+@app.post("/api/config/halow")
+@authed
+def api_config_halow():
+    out = []
+    ssid = request.form.get("ssid")
+    if ssid:
+        if request.form.get("confirm") != "1":
+            return jsonify({"error": "needs confirm=1: STAs lose the network "
+                            "until they are reconfigured with the new SSID"}), 400
+        ok, o = halowctl(["set", f"ssid={ssid}"])
+        out.append(o)
+        if not ok:
+            return jsonify({"error": o}), 500
+    pw = request.form.get("passphrase")
+    if pw:
+        if request.form.get("confirm") != "1":
+            return jsonify({"error": "needs confirm=1: STAs lose the network "
+                            "until they hold the new passphrase"}), 400
+        ok, o = halowctl(["set-passphrase"], stdin=pw)
+        out.append("passphrase updated" if ok else o)
+        if not ok:
+            return jsonify({"error": o}), 500
+    mode = request.form.get("mode")
+    if mode:
+        ok, o = halowctl(["mode", mode])
+        out.append(o)
+        if not ok:
+            return jsonify({"error": o}), 500
+    return jsonify({"ok": True, "output": "\n".join(out)})
+
+
+@app.post("/api/config/wifi")
+@authed
+def api_config_wifi():
+    args = []
+    for k in ("ssid", "channel"):
+        v = request.form.get(k)
+        if v:
+            args.append(f"{k}={v}")
+    out = []
+    if args:
+        ok, o = halowctl(["wifi-config"] + args)
+        out.append(o)
+        if not ok:
+            return jsonify({"error": o}), 500
+    pw = request.form.get("passphrase")
+    if pw:
+        ok, o = halowctl(["wifi-passphrase"], stdin=pw)
+        out.append("passphrase updated" if ok else o)
+        if not ok:
+            return jsonify({"error": o}), 500
+    state = request.form.get("enabled")
+    if state in ("on", "off"):
+        ok, o = halowctl(["wifi-ap", state])
+        out.append(o)
+    return jsonify({"ok": True, "output": "\n".join(out)})
+
+
+@app.post("/api/config/dhcp")
+@authed
+def api_config_dhcp():
+    args = []
+    for k in ("start", "end", "lease", "dns"):
+        v = request.form.get(k)
+        if v:
+            args.append(f"{k}={v}")
+    if not args:
+        return jsonify({"error": "nothing to change"}), 400
+    ok, o = halowctl(["dhcp-config"] + args)
+    return (jsonify({"ok": True, "output": o}) if ok
+            else (jsonify({"error": o}), 500))
+
+
+@app.post("/api/config/forwards")
+@authed
+def api_config_forwards():
+    op = request.form.get("op", "add")
+    if op not in ("add", "del"):
+        return jsonify({"error": "op must be add or del"}), 400
+    args = ["forwards", op, f"proto={request.form.get('proto', 'tcp')}",
+            f"ext={request.form.get('ext', '')}"]
+    if op == "add":
+        args.append(f"dest={request.form.get('dest', '')}")
+    ok, o = halowctl(args)
+    return (jsonify({"ok": True, "output": o}) if ok
+            else (jsonify({"error": o}), 500))
+
+
+@app.post("/api/system/reboot")
+@authed
+def api_system_reboot():
+    if request.form.get("confirm") != "1":
+        return jsonify({"error": "needs confirm=1: reboots the gateway"}), 400
+    subprocess.Popen(["sudo", "/usr/sbin/reboot"])
+    return jsonify({"ok": True, "output": "rebooting"})
+
+
 # ---------- Mesh nodes ----------
 
 def node_get(node, path):
@@ -406,7 +569,7 @@ border-radius:6px;padding:5px 8px;font:inherit;width:110px}
 <a href="/logout" style="color:var(--dim);margin-left:14px;text-decoration:none">logout</a></header>
 <main id="main"></main>
 <script>
-const TABS=["Overview","HaLow","Router","Nodes"];let tab="Overview";
+const TABS=["Overview","HaLow","Router","Config","Nodes"];let tab="Overview";
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 async function j(u,opt){const r=await fetch(u,opt);if(!r.ok)throw new Error(r.status);return r.json()}
@@ -416,7 +579,61 @@ async function render(){nav();const m=$("#main");m.innerHTML="<p class='warn'>lo
  try{ if(tab==="Overview")m.innerHTML=await ovw();
  else if(tab==="HaLow")m.innerHTML=await halow();
  else if(tab==="Router")m.innerHTML=await router();
+ else if(tab==="Config")m.innerHTML=await config();
  else m.innerHTML=await nodes();}catch(e){m.innerHTML=`<p class="bad">${esc(e)}</p>`}}
+async function config(){const c=await j("/api/config");
+ const fwds=c.forwards.length?c.forwards.map(f=>
+  `<tr><td>${esc(f.proto)}</td><td>${f.ext}</td><td>${esc(f.dest)}</td>
+   <td><button class="act" onclick="fwdDel('${esc(f.proto)}',${f.ext})">delete</button></td></tr>`).join("")
+  :`<tr><td colspan=4 class="warn">no port forwards</td></tr>`;
+ return `<div class="card"><h2>HaLow network identity</h2>
+ <p>SSID <input id="h-ssid" value="${esc(c.halow.ssid)}">
+ passphrase <input id="h-pass" type="password" placeholder="${c.halow.passphrase_set?"(set — write only)":"(unset)"}">
+ <button class="act" onclick="cfgHalow()">apply</button></p>
+ <p style="color:var(--dim)">Changing either disconnects every station until it is reconfigured — you will be asked to confirm.</p></div>
+ <div class="card"><h2>2.4 GHz AP (mesh-2g) — ${c.wifi.active?"<span class='ok'>on</span>":"<span class='warn'>off</span>"}</h2>
+ <p>SSID <input id="w-ssid" value="${esc(c.wifi.ssid)}">
+ channel <input id="w-chan" value="${esc(c.wifi.channel)}" style="width:60px">
+ passphrase <input id="w-pass" type="password" placeholder="(write only)">
+ <button class="act" onclick="cfgWifi()">apply</button>
+ <button class="act" onclick="wifiAp('${c.wifi.active?"off":"on"}')">turn ${c.wifi.active?"off":"on"}</button></p></div>
+ <div class="card"><h2>DHCP — HaLow net (10.117.0.0/24)</h2>
+ <p>range <input id="d-start" value="${esc(c.dhcp.start)}"> – <input id="d-end" value="${esc(c.dhcp.end)}">
+ lease <input id="d-lease" value="${esc(c.dhcp.lease)}" style="width:70px">
+ DNS <input id="d-dns" value="${esc(c.dhcp.dns)}">
+ <button class="act" onclick="cfgDhcp()">apply</button></p></div>
+ <div class="card"><h2>Port forwards (LAN → HaLow net)</h2>
+ <table><tr><th>proto</th><th>ext port</th><th>destination</th><th></th></tr>${fwds}</table>
+ <p><select id="f-proto"><option>tcp</option><option>udp</option></select>
+ ext <input id="f-ext" style="width:70px" placeholder="8080">
+ → <input id="f-dest" placeholder="10.117.0.50:80">
+ <button class="act" onclick="fwdAdd()">add</button></p></div>
+ <div class="card"><h2>System</h2>
+ <p><button class="act" onclick="reboot()">reboot gateway</button></p>
+ <p style="color:var(--dim)">API: every change here is also scriptable —
+ same endpoints with <code>curl -u user:pass</code> or
+ <code>-H "Authorization: Bearer &lt;ADMIN_TOKEN&gt;"</code>.
+ See /api/config, /api/config/{halow,wifi,dhcp,forwards}, /api/system/reboot.</p></div>
+ <pre id="cfg-out"></pre>`}
+async function post(u,data){const fd=new FormData();
+ for(const[k,v]of Object.entries(data))if(v!==""&&v!=null)fd.append(k,v);
+ const r=await fetch(u,{method:"POST",body:fd});const d=await r.json();
+ const el=document.getElementById("cfg-out");
+ if(el)el.textContent=d.error||d.output||"ok";
+ if(!d.error)setTimeout(render,1200);return d}
+async function cfgHalow(){const ssid=$("#h-ssid").value,pass=$("#h-pass").value;
+ if(!ssid&&!pass)return;
+ if(!confirm("Changing the HaLow identity disconnects every station. Continue?"))return;
+ await post("/api/config/halow",{ssid,passphrase:pass,confirm:1})}
+async function cfgWifi(){await post("/api/config/wifi",
+ {ssid:$("#w-ssid").value,channel:$("#w-chan").value,passphrase:$("#w-pass").value})}
+async function cfgDhcp(){await post("/api/config/dhcp",
+ {start:$("#d-start").value,end:$("#d-end").value,lease:$("#d-lease").value,dns:$("#d-dns").value})}
+async function fwdAdd(){await post("/api/config/forwards",
+ {op:"add",proto:$("#f-proto").value,ext:$("#f-ext").value,dest:$("#f-dest").value})}
+async function fwdDel(p,e){await post("/api/config/forwards",{op:"del",proto:p,ext:e})}
+async function reboot(){if(confirm("Reboot the gateway now?"))
+ await post("/api/system/reboot",{confirm:1})}
 async function ovw(){const s=await j("/api/system"),h=await j("/api/halow");
  const t=(parseInt(s.temp)/1000).toFixed(1);
  return `<div class="card"><h2>gateway</h2><div class="grid">

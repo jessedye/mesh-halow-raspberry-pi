@@ -8,9 +8,11 @@ ExecStart=/usr/bin/python3 /usr/local/lib/halow_ui.py
 Restart=on-failure
 RestartSec=5
 User=halow-ui
-# The UI shells out to a fixed set of privileged commands via sudoers.d/halow-ui
+# The UI shells out to a fixed set of privileged commands via sudoers.d/halow-ui.
+# ProtectSystem=true (not full): the config API's halowctl mutations write
+# /etc/halow and /etc/dnsmasq.d through sudo, which inherits this namespace.
 NoNewPrivileges=no
-ProtectSystem=full
+ProtectSystem=true
 PrivateTmp=yes
 
 [Install]

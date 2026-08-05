@@ -9,6 +9,11 @@
 #   halowctl mode ap|sta       broadcast the SSID, or join it as a station
 #   halowctl probe             reload the driver and report chip probe result
 #   halowctl restart|stop      control the AP service
+#   halowctl set-passphrase    new HaLow SAE passphrase on stdin (8-63 chars)
+#   halowctl wifi-config K=V.. 2.4G AP: ssid=NAME channel=1-11
+#   halowctl wifi-passphrase   new 2.4G WPA2 passphrase on stdin
+#   halowctl dhcp-config K=V.. start=IP end=IP lease=12h dns=1.1.1.1,8.8.8.8
+#   halowctl forwards CMD      list | add proto=tcp ext=N dest=IP:PORT | del ext=N proto=tcp | apply
 # Config: /etc/halow/halow.env (+ halow-profiles.json alongside this repo copy)
 set -euo pipefail
 
@@ -144,6 +149,121 @@ PY
       off) sudo nmcli con down mesh-2g ;;
       status) nmcli -t -f NAME,DEVICE,STATE con show --active | grep mesh-2g || echo "mesh-2g down" ;;
       *) echo "usage: halowctl wifi-ap on|off|status"; exit 1 ;;
+    esac
+    ;;
+  set-passphrase)
+    # stdin, never argv: argv is visible in ps and shell history
+    PASS=$(head -c 256)
+    n=${#PASS}
+    [ "$n" -ge 8 ] && [ "$n" -le 63 ] || { echo "passphrase must be 8-63 chars"; exit 1; }
+    sudo env NEWPASS="$PASS" python3 - <<'PY'
+import os, re
+p = "/etc/halow/halow.env"
+s = open(p).read()
+s = re.sub(r"(?m)^HALOW_PASSPHRASE=.*$", "HALOW_PASSPHRASE=" + os.environ["NEWPASS"], s)
+open(p, "w").write(s)
+PY
+    sudo "$0" gen && sudo systemctl restart halow-ap 2>/dev/null || true
+    echo "halow passphrase updated"
+    ;;
+  wifi-config)
+    shift
+    for kv in "$@"; do
+      k=${kv%%=*}; v=${kv#*=}
+      case "$k" in
+        ssid)    sudo nmcli con modify mesh-2g 802-11-wireless.ssid "$v" ;;
+        channel) [[ "$v" =~ ^([1-9]|1[01])$ ]] || { echo "channel 1-11"; exit 1; }
+                 sudo nmcli con modify mesh-2g 802-11-wireless.channel "$v" ;;
+        *) echo "unknown key $k (ssid|channel)"; exit 1 ;;
+      esac
+    done
+    nmcli -t -f NAME,STATE con show --active | grep -q mesh-2g && sudo nmcli con up mesh-2g >/dev/null
+    echo "wifi config updated"
+    ;;
+  wifi-passphrase)
+    PASS=$(head -c 256)
+    n=${#PASS}
+    [ "$n" -ge 8 ] && [ "$n" -le 63 ] || { echo "passphrase must be 8-63 chars"; exit 1; }
+    sudo nmcli con modify mesh-2g 802-11-wireless-security.psk "$PASS"
+    nmcli -t -f NAME,STATE con show --active | grep -q mesh-2g && sudo nmcli con up mesh-2g >/dev/null
+    echo "wifi passphrase updated"
+    ;;
+  dhcp-config)
+    shift
+    CONF=/etc/dnsmasq.d/halow.conf
+    START=$(grep -oP "dhcp-range=\K[0-9.]+" "$CONF"); END=$(grep -oP "dhcp-range=[0-9.]+,\K[0-9.]+" "$CONF")
+    LEASE=$(grep -oP "dhcp-range=[0-9.]+,[0-9.]+,\K\S+" "$CONF"); DNS=$(grep -oP "option:dns-server,\K\S+" "$CONF")
+    for kv in "$@"; do
+      k=${kv%%=*}; v=${kv#*=}
+      case "$k" in
+        start) [[ "$v" =~ ^10\.117\.0\.[0-9]+$ ]] || { echo "start must be 10.117.0.x"; exit 1; }; START=$v ;;
+        end)   [[ "$v" =~ ^10\.117\.0\.[0-9]+$ ]] || { echo "end must be 10.117.0.x"; exit 1; }; END=$v ;;
+        lease) [[ "$v" =~ ^[0-9]+[hm]$ ]] || { echo "lease like 12h or 90m"; exit 1; }; LEASE=$v ;;
+        dns)   [[ "$v" =~ ^[0-9.,]+$ ]] || { echo "dns is comma-separated IPs"; exit 1; }; DNS=$v ;;
+        *) echo "unknown key $k (start|end|lease|dns)"; exit 1 ;;
+      esac
+    done
+    sudo tee "$CONF" >/dev/null <<EOF
+# Managed by halowctl dhcp-config — edits here are overwritten.
+interface=halow0
+bind-dynamic
+dhcp-range=${START},${END},${LEASE}
+dhcp-option=option:router,10.117.0.1
+dhcp-option=option:dns-server,${DNS}
+dhcp-authoritative
+EOF
+    sudo systemctl restart dnsmasq && echo "dhcp: ${START}-${END} lease ${LEASE} dns ${DNS}"
+    ;;
+  forwards)
+    FWD=/etc/halow/forwards.json
+    sub=${2:-list}
+    [ -f "$FWD" ] || echo "[]" | sudo tee "$FWD" >/dev/null
+    case "$sub" in
+      list) cat "$FWD" ;;
+      add|del)
+        shift 2
+        sudo env OP="$sub" ARGS="$*" python3 - <<'PY'
+import json, os, re, sys
+fwd = "/etc/halow/forwards.json"
+rules = json.load(open(fwd))
+kv = dict(a.split("=", 1) for a in os.environ["ARGS"].split())
+op = os.environ["OP"]
+proto = kv.get("proto", "tcp")
+if proto not in ("tcp", "udp"): sys.exit("proto must be tcp|udp")
+ext = int(kv["ext"])
+if not 1 <= ext <= 65535: sys.exit("ext port out of range")
+if op == "add":
+    dest = kv["dest"]
+    if not re.match(r"^10\.117\.0\.\d+:\d+$", dest):
+        sys.exit("dest must be 10.117.0.x:port")
+    rules = [r for r in rules if not (r["proto"] == proto and r["ext"] == ext)]
+    rules.append({"proto": proto, "ext": ext, "dest": dest})
+else:
+    rules = [r for r in rules if not (r["proto"] == proto and r["ext"] == ext)]
+json.dump(rules, open(fwd, "w"), indent=1)
+print(f"{op} ok — {len(rules)} rule(s)")
+PY
+        sudo chgrp halow-ui "$FWD" && sudo chmod 640 "$FWD"
+        sudo "$0" forwards apply
+        ;;
+      apply)
+        {
+          echo "table ip halow_fwd"
+          echo "delete table ip halow_fwd"
+          echo "table ip halow_fwd {"
+          echo "  chain prerouting {"
+          echo "    type nat hook prerouting priority -101; policy accept;"
+          python3 -c '
+import json
+for r in json.load(open("/etc/halow/forwards.json")):
+    ip, port = r["dest"].split(":")
+    print("    iifname \"eth0\" %s dport %s dnat to %s:%s"
+          % (r["proto"], r["ext"], ip, port))'
+          echo "  }"
+          echo "}"
+        } | sudo nft -f - && echo "forwards applied"
+        ;;
+      *) echo "usage: halowctl forwards list|add|del|apply"; exit 1 ;;
     esac
     ;;
   restart) sudo systemctl restart halow-ap ;;

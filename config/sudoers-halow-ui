@@ -1,10 +1,17 @@
 # /etc/sudoers.d/halow-ui — the web console's exact privileged surface.
-# Anything not listed here the UI cannot do; keep this list short on purpose.
+# Every UI/API mutation routes through halowctl subcommands; anything not
+# listed here the UI cannot do. Keep this list short on purpose.
 halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl gen
 halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl set-profile *
 halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl set *
 halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl probe
 halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl mode ap, /usr/local/bin/halowctl mode sta
 halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl wifi-ap on, /usr/local/bin/halowctl wifi-ap off
+halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl set-passphrase
+halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl wifi-config *
+halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl wifi-passphrase
+halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl dhcp-config *
+halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl forwards *
 halow-ui ALL=(root) NOPASSWD: /usr/sbin/nft list table ip halow
 halow-ui ALL=(root) NOPASSWD: /usr/bin/systemctl restart halow-ap
+halow-ui ALL=(root) NOPASSWD: /usr/sbin/reboot

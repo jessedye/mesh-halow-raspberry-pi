@@ -99,3 +99,23 @@ binaries dropped in place for a minutes-long restore on the same kernel.
 the unprivileged listener at :8443, which also still answers directly).
 Login = the mesh-v4 admin credential. Works from the LAN, HaLow clients
 (10.117.0.1), and `mesh-2g` WiFi clients (10.42.0.1).
+
+## Configuration API
+
+Every UI mutation is equally scriptable. Auth: session cookie (browser),
+HTTP Basic (`curl -u`), or `Authorization: Bearer <ADMIN_TOKEN>` (the
+mesh-v4 token; only its sha256 is stored on the gateway).
+
+| Endpoint | Form fields |
+|---|---|
+| `GET /api/config` | — (current halow/wifi/dhcp/forwards state) |
+| `POST /api/config/halow` | `ssid`, `passphrase` (write-only), `mode=ap\|sta`; identity changes need `confirm=1` |
+| `POST /api/config/wifi` | `ssid`, `channel` (1-11), `passphrase` (write-only), `enabled=on\|off` |
+| `POST /api/config/dhcp` | `start`, `end` (10.117.0.x), `lease` (12h), `dns` (csv) |
+| `POST /api/config/forwards` | `op=add\|del`, `proto=tcp\|udp`, `ext`, `dest=10.117.0.x:port` |
+| `POST /api/system/reboot` | `confirm=1` |
+| `POST /api/halow/profile` | `name` (long-range/mid-range/balanced/max-rate) |
+| `POST /api/halow/probe` | — |
+
+All mutations route through `halowctl` subcommands — the sudoers file is
+the complete privileged surface. Passphrases travel on stdin, never argv.
