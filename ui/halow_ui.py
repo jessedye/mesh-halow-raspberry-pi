@@ -1291,14 +1291,129 @@ def api_diag_bundle():
 
 # ---------- Mesh nodes ----------
 
-def node_get(node, path):
-    req = urllib.request.Request(node["url"].rstrip("/") + path)
-    req.add_header("Authorization", "Bearer " + node.get("token", ""))
+# Proxy path failover (roadmap 26): per-node leg preference with
+# vip.py-style damping — demote LAN after 2 consecutive failures,
+# promote back after 3 successes; while demoted, one cheap LAN HEAD per
+# 30s lets it recover without waiting for halow to break.
+_NPATH = {}   # name -> {"pref","fails","oks","changed","last_recheck"}
+NODE_TIMEOUT = 5
+DEMOTE_AFTER, PROMOTE_AFTER = 2, 3   # mesh-v4 tools/vip.py:47-48
+LAN_RECHECK_S = 30
+NODE_ADDRS = "/var/lib/halow/node-addrs.json"
+
+
+def _node_ssl():
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE  # nodes use self-signed certs
-    with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+    return ctx
+
+
+def _lease_ip_for_mac(mac):
+    """Read from reality at call time — never derived (vip.py's one-octet
+    derived-address failure)."""
+    if not mac:
+        return None
+    try:
+        for line in open("/var/lib/misc/dnsmasq.leases"):
+            p = line.split()
+            if len(p) >= 3 and p[1].lower() == mac:
+                return p[2]
+    except OSError:
+        pass
+    return None
+
+
+def _fetch_leg(url, token, path, timeout=NODE_TIMEOUT):
+    req = urllib.request.Request(url.rstrip("/") + path)
+    req.add_header("Authorization", "Bearer " + (token or ""))
+    with urllib.request.urlopen(req, timeout=timeout,
+                                context=_node_ssl()) as r:
         return json.load(r)
+
+
+def _harvest_addrs(name, path, data):
+    """Persist device-stated lora/vip addresses from /api/ip responses:
+    an unreachable node is exactly when the LoRa address is needed and
+    exactly when it cannot be queried (vip.py:58-61). Addresses only."""
+    if path != "/api/ip" or not isinstance(data, dict):
+        return
+    netif = data.get("data", data).get("netif", {})
+    lora, vip = netif.get("address"), netif.get("vip_address")
+    if not (lora or vip):
+        return
+    try:
+        cache = json.load(open(NODE_ADDRS))
+    except Exception:
+        cache = {}
+    cache[name] = {"lora": lora, "fwvip": vip, "seen": int(time.time()),
+                   "source": "device"}
+    tmp = NODE_ADDRS + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(json.dumps(cache, indent=1))
+    os.replace(tmp, NODE_ADDRS)
+
+
+def node_get(node, path):
+    """Two-leg fetch: LAN url, then the node's live HaLow lease by MAC.
+    Returns (data, path_name, via_host); raises with per-leg detail when
+    both fail. Which path answered is reported, never guessed."""
+    name = node.get("name", "?")
+    st = _NPATH.setdefault(name, {"pref": "lan", "fails": 0, "oks": 0,
+                                  "changed": 0, "last_recheck": 0})
+    lan_host = node.get("url", "").split("://", 1)[-1].split("/", 1)[0]
+    legs = [("lan", node.get("url"))]
+    hip = _lease_ip_for_mac((node.get("mac") or "").lower())
+    if hip:
+        legs.append(("halow", f"https://{hip}"))
+    if st["pref"] == "halow":
+        legs.reverse()
+    attempts = []
+    result = None
+    for leg, url in legs:
+        if not url:
+            continue
+        try:
+            data = _fetch_leg(url, node.get("token"), path)
+            result = (data, leg,
+                      url.split("://", 1)[-1].split("/", 1)[0])
+            break
+        except Exception as e:
+            attempts.append({"path": leg,
+                             "via": url.split("://", 1)[-1].split("/", 1)[0],
+                             "error": str(e)[:120]})
+    now = time.time()
+    lan_tried = any(a["path"] == "lan" for a in attempts) or \
+        (result and result[1] == "lan")
+    lan_ok = bool(result and result[1] == "lan")
+    if lan_tried:
+        if lan_ok:
+            st["oks"] += 1
+            st["fails"] = 0
+            if st["pref"] == "halow" and st["oks"] >= PROMOTE_AFTER:
+                st["pref"], st["changed"] = "lan", int(now)
+        else:
+            st["fails"] += 1
+            st["oks"] = 0
+            if st["pref"] == "lan" and st["fails"] >= DEMOTE_AFTER:
+                st["pref"], st["changed"] = "halow", int(now)
+    elif st["pref"] == "halow" and now - st["last_recheck"] > LAN_RECHECK_S:
+        # demoted: one bounded LAN recheck per 30s feeds the counters
+        st["last_recheck"] = now
+        try:
+            req = urllib.request.Request(node["url"], method="HEAD")
+            urllib.request.urlopen(req, timeout=2, context=_node_ssl())
+            st["oks"] += 1
+            st["fails"] = 0
+            if st["oks"] >= PROMOTE_AFTER:
+                st["pref"], st["changed"] = "lan", int(now)
+        except Exception:
+            st["oks"] = 0
+    if result is None:
+        raise RuntimeError(json.dumps({"error": "all paths failed",
+                                       "attempts": attempts}))
+    _harvest_addrs(name, path, result[0])
+    return result
 
 
 @app.get("/api/nodes")
@@ -1332,11 +1447,15 @@ def api_nodes():
     for n in nodes:
         entry = {"name": n["name"], "url": n["url"]}
         try:
-            entry["diag"] = node_get(n, "/api/diag")
+            data, path, via = node_get(n, "/api/diag")
+            entry["diag"] = data
             entry["reachable"] = True
+            entry["path"], entry["via"] = path, via
         except Exception as e:
             entry["reachable"] = False
-            entry["error"] = str(e)
+            entry["error"] = str(e)[:300]
+        entry["proxy"] = dict(_NPATH.get(n["name"], {}))
+        entry["proxy"].pop("last_recheck", None)
         out.append(entry)
     return jsonify({"nodes": out, "cached": False})
 
@@ -1397,11 +1516,149 @@ def api_node_proxy(name, sub):
     try:
         with open(NODES_CONF) as f:
             nodes = {n["name"]: n for n in json.load(f)["nodes"]}
-        return jsonify(node_get(nodes[name], "/api/" + sub))
+        data, path, via = node_get(nodes[name], "/api/" + sub)
+        resp = jsonify(data)
+        resp.headers["X-Node-Path"] = path   # headers: the node's JSON
+        resp.headers["X-Node-Via"] = via     # body passes through untouched
+        return resp
     except KeyError:
         return jsonify({"error": f"unknown node {name}"}), 404
+    except RuntimeError as e:
+        try:
+            return jsonify(json.loads(str(e))), 502
+        except Exception:
+            return jsonify({"error": str(e)}), 502
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+
+REACH_BUDGET_S = 20
+REACH_TTL_S = 20
+_REACH_CACHE = {"t": 0, "data": None}
+_REACH_LOCK = None  # created lazily (threading import stays in __main__)
+_ADDR_RE = None
+
+
+def _valid_addr(a):
+    """Lease IPs and device-reported addresses are external input; a
+    hostile or corrupted node must not reach sh()."""
+    import re as _re
+    return bool(a and _re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", a))
+
+
+def _has_route(addr):
+    """A probe without a specific route exits via the default and the
+    guaranteed failure would read as a node fault (the vip.py trap)."""
+    out = sh(f"ip route show to match {addr}")
+    return any(not l.startswith("default") for l in out.splitlines() if l)
+
+
+def _probe(addr, deadline):
+    if time.monotonic() > deadline:
+        return {"status": "skipped"}
+    r = {}
+    t0 = time.monotonic()
+    p = subprocess.run(["ping", "-c", "1", "-W", "1", "-n", addr],
+                       capture_output=True)
+    r["icmp"] = {"ok": p.returncode == 0}
+    if p.returncode == 0:
+        r["icmp"]["ms"] = round((time.monotonic() - t0) * 1000, 1)
+    # HTTP HEAD, never a bare TCP connect (bare :443 connects crashed
+    # nodes). Plain-HTTP report first: answers without costing the node
+    # one of its ~6 TLS sessions.
+    for url, ctx in ((f"http://{addr}/json/report", None),
+                     (f"https://{addr}/", _node_ssl())):
+        if time.monotonic() > deadline:
+            r["http"] = {"ok": False, "error": "budget exhausted"}
+            break
+        try:
+            t1 = time.monotonic()
+            req = urllib.request.Request(url, method="HEAD")
+            resp = urllib.request.urlopen(req, timeout=2, context=ctx)
+            r["http"] = {"ok": True, "status": resp.status, "url": url,
+                         "ms": round((time.monotonic() - t1) * 1000, 1)}
+            break
+        except urllib.error.HTTPError as e:
+            r["http"] = {"ok": True, "status": e.code, "url": url,
+                         "note": "server answered - the path is up"}
+            break
+        except Exception as e:
+            r["http"] = {"ok": False, "error": str(e)[:80]}
+    return r
+
+
+@app.get("/api/reach")
+@authed
+def api_reach():
+    """Per-node reachability matrix across every address family: LAN url,
+    live HaLow lease (by mac), device-stated LoRa/VIP addresses. The
+    one-call answer to 'which of this node's addresses actually route?'
+    Bounded (20s budget, 20s cache) and button-driven — never on render."""
+    global _REACH_LOCK
+    if _REACH_LOCK is None:
+        import threading
+        _REACH_LOCK = threading.Lock()
+    now = time.time()
+    with _REACH_LOCK:
+        if _REACH_CACHE["data"] and now - _REACH_CACHE["t"] < REACH_TTL_S:
+            out = dict(_REACH_CACHE["data"])
+            out["cached"] = True
+            out["age_s"] = int(now - _REACH_CACHE["t"])
+            return jsonify(out)
+        deadline = time.monotonic() + REACH_BUDGET_S
+        t_start = time.monotonic()
+        try:
+            nodes = json.load(open(NODES_CONF)).get("nodes", [])
+        except Exception:
+            nodes = []
+        try:
+            addrs = json.load(open(NODE_ADDRS))
+        except Exception:
+            addrs = {}
+        result = []
+        for n in nodes:
+            name = n.get("name", "?")
+            mac = (n.get("mac") or "").lower()
+            paths = []
+            lan = n.get("url", "").split("://", 1)[-1].split("/", 1)[0]\
+                .split(":", 1)[0]
+            if _valid_addr(lan):
+                paths.append({"family": "lan", "addr": lan,
+                              **_probe(lan, deadline)})
+            else:
+                paths.append({"family": "lan", "status": "bad-addr"})
+            if not mac:
+                paths.append({"family": "halow", "status": "no-mac"})
+            else:
+                hip = _lease_ip_for_mac(mac)
+                if not hip:
+                    paths.append({"family": "halow", "status": "no-lease"})
+                elif not _valid_addr(hip):
+                    paths.append({"family": "halow", "status": "bad-addr"})
+                else:
+                    paths.append({"family": "halow", "addr": hip,
+                                  **_probe(hip, deadline)})
+            known = addrs.get(name, {})
+            for fam in ("lora", "fwvip"):
+                a = known.get(fam)
+                if not a:
+                    paths.append({"family": fam, "status": "unknown"})
+                elif not _valid_addr(a):
+                    paths.append({"family": fam, "status": "bad-addr"})
+                elif not _has_route(a):
+                    paths.append({"family": fam, "addr": a,
+                                  "status": "no-route"})
+                else:
+                    paths.append({"family": fam, "addr": a,
+                                  **_probe(a, deadline)})
+            result.append({"name": name, "mac": mac or None,
+                           "paths": paths})
+        data = {"generated": int(now), "cached": False, "age_s": 0,
+                "elapsed_s": round(time.monotonic() - t_start, 1),
+                "budget_s": REACH_BUDGET_S, "nodes": result}
+        _REACH_CACHE["t"] = now
+        _REACH_CACHE["data"] = data
+        return jsonify(data)
 
 
 # ---------- System ----------
@@ -1935,7 +2192,24 @@ async function nodes(){const d=await j("/api/nodes");
  <p style="color:var(--dim)">states: healthy · stale (rebooted / silent past 3× its own interval)
   · wifi-down (a peer still hears it on LoRa) · down · unknown (alive but odd — auth/rate-limit).
   Live buttons poke the node directly and cost it a TLS session; the table never does.</p></div>
- ${adopt}<pre id="nv-out"></pre>`}
+ ${adopt}<div class="card"><h2>reachability matrix</h2>
+ <p><button class="act" onclick="reachRun(this)">probe all paths</button>
+ <span style="color:var(--dim)">— ICMP + HTTP HEAD per address family (LAN / HaLow lease /
+ LoRa / VIP); never bare connects; 20s budget; button-only by design.</span></p>
+ <div id="reach-out"></div></div><pre id="nv-out"></pre>`}
+async function reachRun(btn){btn.disabled=true;btn.textContent="probing…";
+ try{const d=await j("/api/reach");
+ const cell=p=>{if(p.status)return `<span class="warn">${esc(p.status)}</span>`;
+  const i=p.icmp&&p.icmp.ok?`icmp ${p.icmp.ms??"?"}ms`:`<span class="bad">icmp ✗</span>`;
+  const h=p.http&&p.http.ok?`http ${p.http.status}`:`<span class="bad">http ✗</span>`;
+  return `${esc(p.addr||"")}<br>${i} · ${h}`};
+ document.getElementById("reach-out").innerHTML=
+  `<table><tr><th>node</th><th>lan</th><th>halow</th><th>lora</th><th>fwvip</th></tr>`+
+  d.nodes.map(n=>{const by={};n.paths.forEach(p=>by[p.family]=p);
+   return `<tr><td>${esc(n.name)}</td>${["lan","halow","lora","fwvip"].map(f=>
+    `<td>${by[f]?cell(by[f]):"—"}</td>`).join("")}</tr>`}).join("")+
+  `</table><p style="color:var(--dim)">${d.cached?`cached ${d.age_s}s ago`:`fresh, ${d.elapsed_s}s`}</p>`}
+ finally{btn.disabled=false;btn.textContent="probe all paths"}}
 async function nodeLive(n){const el=document.getElementById("nv-out");
  el.textContent="poking "+n+" (costs the node a TLS session)…";
  try{const d=await j(`/api/nodes/${n}/diag`);
