@@ -23,7 +23,8 @@ chk "SPI device bound" sh -c 'ls -l /sys/bus/spi/drivers/morse_spi/ 2>/dev/null 
 # honest check is that the most recent probe attempt did not fail.
 chk "last probe attempt clean" sh -c 'journalctl -k -q --no-pager -g "morse" -n 10 | grep -q "probe failed" && exit 1; echo "no probe failure in recent kernel log"'
 chk "wlan interface exists" sh -c 'iw dev | grep -A1 "phy" | grep Interface'
-chk "morse_cli answers" sh -c 'IF=$(iw dev | awk "/Interface/{print \$2; exit}"); morse_cli -i "$IF" version'
+chk "morse_cli answers (fw version)" sh -c 'sudo morse_cli -i halow0 version 2>/dev/null | grep "FW Version"'
+chk "AP enabled (mesh beaconing)" sh -c 'iw dev halow0 info | grep -E "ssid|type AP"'
 chk "2.4GHz AP (mesh-2g)" sh -c 'nmcli -t -f NAME,STATE con show --active | grep mesh-2g'
 echo
 journalctl -k -q --no-pager -g "morse" -n 10

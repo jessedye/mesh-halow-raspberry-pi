@@ -66,3 +66,12 @@ sudo reboot
 `s1g-bins.tar.gz` (hostapd/wpa_supplicant S1G + morse_cli). A fresh SD
 card needs only Pi OS + `scripts/install.sh` (which rebuilds), or these
 binaries dropped in place for a minutes-long restore on the same kernel.
+- **2026-08-05 13:12 — FIRST CONTACT & FULL BRING-UP.** After the dead MISO
+  jumper was replaced, the chip probed (fw `rel_mm6108_2_0_1`), and the
+  `mesh` AP came up: S1G ch48, 926 MHz, 4 MHz wide, WPA3-SAE. Working SPI
+  timing: 4 MHz + 64-byte ack windows (see `config/morse.conf` — the 0x40xx
+  register block acks outside the driver's default 4-byte window; identical
+  at 1 and 4 MHz, so structural). hostapd needed `hw_mode=a` (S1G presents
+  as mapped 5 GHz) and `rsn_pairwise=CCMP`. Cold-reboot verified: 9/9
+  verify.sh PASS, halow0 at 10.117.0.1/24, dnsmasq serving, both APs
+  (`mesh` HaLow + `mesh-2g` 2.4 GHz) beaconing. Debug hexdump removed.
