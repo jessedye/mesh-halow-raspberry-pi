@@ -12,7 +12,7 @@ giving the mesh-v4 transport ladder its HaLow rung.
 
 | Path | What |
 |---|---|
-| `docs/wiring.md` | Module-pad ↔ Pi-header pin map, conflicts, hardware traps |
+| `docs/wiring.md` | Debug-board header ↔ Pi pin map (with wire colors), SPI timing, fault history |
 | `docs/software-stack.md` | Pinned versions, why each, caveats, regulatory |
 | `overlays/mm610x-spi-overlay.dts` | Device-tree overlay for the SPI wiring |
 | `config/morse.conf` | `/etc/modprobe.d` options (BCF + `country=US`) |
@@ -26,8 +26,22 @@ giving the mesh-v4 transport ladder its HaLow rung.
 
 - Pi 4B Rev 1.5 (8 GB), Pi OS Lite 64-bit Trixie, kernel 6.18.39+rpt-rpi-v8
 - `192.168.51.202/23` static on eth0 (gw 192.168.50.1, DNS 1.1.1.1/8.8.8.8), user `pi`
-- HT-HC01P wired per `docs/wiring.md` (Morse HAT-compatible map)
+- HT-HC01P on Heltec's debug-board 10-pin header, wired per `docs/wiring.md`
 - Onboard 2.4 GHz WiFi AP `mesh-2g` on wlan0 (NM `shared`, 10.42.0.1/24, same passphrase; toggle: `halowctl wifi-ap on|off`)
+
+### Pin locations (as built — colors and full detail in `docs/wiring.md`)
+
+| Debug header | Pi pin | BCM | | Debug header | Pi pin | BCM |
+|---|---|---|---|---|---|---|
+| 3V3 | 1 | — | | BUSY | 26 | GPIO7 |
+| GND | 6 | — | | WAKE | 5 | GPIO3 |
+| INT | 22 | GPIO25 | | CLK | 23 | GPIO11 |
+| RESET | 29 | GPIO5 | | MISO | 21 | GPIO9 |
+| CS | 24 | GPIO8/CE0 | | MOSI | 19 | GPIO10 |
+
+Pin 1 = corner nearest the SD card; odd pins are the inner row. **Pin 2
+(5 V) stays empty.** SPI timing that works: 4 MHz + 64-byte ack windows
+(`config/morse.conf`) — do not raise without re-testing firmware load.
 
 ## Quick start (fresh Pi)
 
@@ -66,6 +80,9 @@ sudo reboot
 `s1g-bins.tar.gz` (hostapd/wpa_supplicant S1G + morse_cli). A fresh SD
 card needs only Pi OS + `scripts/install.sh` (which rebuilds), or these
 binaries dropped in place for a minutes-long restore on the same kernel.
+
+## First contact
+
 - **2026-08-05 13:12 — FIRST CONTACT & FULL BRING-UP.** After the dead MISO
   jumper was replaced, the chip probed (fw `rel_mm6108_2_0_1`), and the
   `mesh` AP came up: S1G ch48, 926 MHz, 4 MHz wide, WPA3-SAE. Working SPI
