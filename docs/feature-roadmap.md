@@ -279,7 +279,20 @@ nothing on the v1 rejected list); verifier corrections are folded in.
 
 ### Tier 3 — fleet operations through the gateway
 
-25. **Gateway-resident fleet health watcher** — /api/nodes live-fetches
+25. **Gateway-resident fleet health watcher** — DONE 2026-08-05
+    (halow-watch daemon: serialized nodewatch-semantics poller, cheap
+    plain-HTTP /json/report path + every-Nth HTTPS deep poll; /api/nodes
+    now a cache read — 0.014s vs 3.6s live, 253x [M]; 20 viewer requests
+    over 140s generated ZERO node SYNs [M], the only 4 being the
+    watcher's own scheduled deep polls. Both real nodes healthy with
+    learned reboot_count/battery (node2: 1066 lifetime reboots); broken
+    token stays healthy on the auth-free cheap path — can never read as
+    down; dead-url drill -> down + exponential backoff; watcher_stale
+    computed by the UI from cache age; token grep 0 in files+journal;
+    nodes.json schema v2 (mac + expected_interval_s, shared with 26/30)
+    via halowctl node add/del/list with stdin tokens; the deploy-clobber
+    amnesia bug fixed and drilled. Adopt flow + assoc cross-checks await
+    a joined station.) — /api/nodes live-fetches
     every node per request (5-6 s + one of ~6 scarce TLS sessions each;
     two tabs double-tap). Port nodewatch semantics into a cached daemon:
     one node at a time, prefer plain-HTTP /json/report (costs no

@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""halow-watch — gateway-resident fleet health watcher (roadmap 25).
+
+Polls the mesh nodes so viewers never do: /api/nodes becomes a file
+read. The nodes' web server costs 5-6s and one of ~6 TLS sessions per
+authenticated request [M], and this fleet has already reset a node by
+holding two sessions — so the cheap path is unauthenticated plain-HTTP
+/json/report (costs no session, cannot perturb what it measures), with
+the bearer-token /api/diag+settings deep poll only every Nth cycle.
+
+nodewatch.py semantics, made operative: dead-vs-quiet at 3x the node's
+OWN reported interval; HTTP 401/404/429 = alive with an alert, never
+down; empty/malformed body = unknown; wifi-down when a peer still hears
+it on LoRa; reboot loops betrayed only by the reboot_count delta.
+
+Strictly serialized: this process never holds two connections to the
+fleet (the 180s-vs-2s radio-guard lesson). Per-node exponential backoff
+caps a dead node's cost at one timeout per 8 cycles.
+
+Runs unprivileged as halow-ui. The bearer token exists in nodes.json
+(640) and this process's memory — never in the cache, history, journal,
+or any log line.
+"""
+
+import json
+import os
+import ssl
+import subprocess
+import time
+import urllib.request
+
+STATE_DIR = "/var/lib/halow"
+CACHE = os.path.join(STATE_DIR, "nodewatch.json")
+HISTORY = os.path.join(STATE_DIR, "nodewatch-history.jsonl")
+NODES = "/etc/halow/nodes.json"
+ENVF = "/etc/halow/halow.env"
+RESERVATIONS = "/etc/dnsmasq.d/halow-reservations.conf"
+LEASES = "/var/lib/misc/dnsmasq.leases"
+HOLD_MULTIPLIER = 3       # nodewatch.py:52
+FALLBACK_INTERVAL = 3600  # under-alerting beats crying wolf
+REQ_TIMEOUT = 10
+RING_LINES = 2880
+REPORT_FIELDS = ("heap_free", "wifi_rssi", "air_util_tx",
+                 "channel_utilization")  # whitelist — never the whole body
+
+SSL_CTX = ssl._create_unverified_context()  # fleet certs are self-signed
+
+
+def envcfg():
+    cfg = {"interval": 120, "diag_every": 10}
+    try:
+        for line in open(ENVF):
+            if line.startswith("HALOW_WATCH_INTERVAL="):
+                cfg["interval"] = max(60, min(int(line.split("=", 1)[1]), 3600))
+            elif line.startswith("HALOW_WATCH_DIAG_EVERY="):
+                cfg["diag_every"] = max(1, int(line.split("=", 1)[1]))
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def atomic_write(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def fetch(url, token=None, timeout=REQ_TIMEOUT):
+    """(status, parsed-json-or-None). Raises on transport failure only."""
+    req = urllib.request.Request(url)
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    ctx = SSL_CTX if url.startswith("https") else None
+    try:
+        r = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        body = r.read(65536)
+        try:
+            return r.status, json.loads(body)
+        except Exception:
+            return r.status, None   # empty/malformed = unknown, not down
+    except urllib.error.HTTPError as e:
+        return e.code, None
+
+
+def load_nodes():
+    try:
+        return json.load(open(NODES)).get("nodes", [])
+    except Exception:
+        return []
+
+
+def load_reservations():
+    out = {}
+    try:
+        for line in open(RESERVATIONS):
+            if line.startswith("dhcp-host="):
+                p = line.strip()[len("dhcp-host="):].split(",")
+                if len(p) >= 2:
+                    out[p[0].lower()] = {"ip": p[1],
+                                         "name": p[2] if len(p) > 2 else ""}
+    except OSError:
+        pass
+    return out
+
+
+def load_leases():
+    out = {}
+    try:
+        for line in open(LEASES):
+            p = line.split()
+            if len(p) >= 4:
+                out[p[1].lower()] = {"ip": p[2], "host": p[3]}
+    except OSError:
+        pass
+    return out
+
+
+def station_macs():
+    try:
+        dump = subprocess.run(["iw", "dev", "halow0", "station", "dump"],
+                              capture_output=True, text=True,
+                              timeout=10).stdout
+        return {l.split()[1].lower() for l in dump.splitlines()
+                if l.startswith("Station")}
+    except Exception:
+        return set()
+
+
+def host_of(url):
+    return url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+
+
+def learned_interval(settings):
+    """min of the three broadcast intervals the node actually applies."""
+    vals = []
+    for k in ("telemetry_interval", "position_broadcast_secs",
+              "neighbor_info_interval"):
+        v = settings.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            vals.append(int(v))
+    return min(vals) if vals else FALLBACK_INTERVAL
+
+
+class NodeState:
+    def __init__(self, name):
+        self.name = name
+        self.fails = 0
+        self.skip = 0
+        self.cycles = 0
+        self.learned = {}      # id, reboot_count, battery_pct, last_diag_at
+        self.interval = FALLBACK_INTERVAL
+
+
+def classify_failure(node, peers_alive):
+    """nodewatch order: HTTP status = alive; peer heard it = wifi-down;
+    else down. Serialized; peers asked only on failure (the economy)."""
+    status, body = None, None
+    try:
+        status, body = fetch(node["url"] + "/api/diag", node.get("token"))
+    except Exception:
+        status = None
+    if status == 401:
+        return "unknown", "auth failure (401) — not a dead node; check the token"
+    if status == 429:
+        return "unknown", "rate-limited (429) — alive and defending itself"
+    if status is not None and body is None and status < 500:
+        return "unknown", f"answered HTTP {status} with no usable body — alive"
+    if status is not None and body is not None:
+        return "healthy", "https answered after report failure"
+    return None, None   # transport-dead over IP; caller tries peers
+
+
+def peer_heard(target_id, peers):
+    for p in peers:
+        try:
+            status, mesh = fetch(p["url"] + "/api/mesh", p.get("token"))
+            if status == 200 and mesh:
+                for edge in (mesh.get("nodes") or mesh.get("edges") or []):
+                    nid = edge.get("id") or edge.get("node_id") or ""
+                    lh = edge.get("last_heard") or edge.get("last_heard_s")
+                    if nid == target_id and lh:
+                        return p["name"], lh
+        except Exception:
+            continue
+    return None, None
+
+
+def poll_cycle(states, cfg, now):
+    nodes = load_nodes()
+    reservations = load_reservations()
+    leases = load_leases()
+    assoc = station_macs()
+    out_nodes = []
+    alive_peers = []
+
+    for n in nodes:
+        name = n.get("name", "?")
+        st = states.setdefault(name, NodeState(name))
+        st.cycles += 1
+        mac = (n.get("mac") or "").lower()
+        entry = {"name": name, "mac": mac, "host": host_of(n.get("url", "")),
+                 "checked_at": now, "alerts": [], "rtt_ms": None,
+                 "consecutive_failures": st.fails,
+                 "assoc": {"associated": mac in assoc if mac else False,
+                           "lease_ip": leases.get(mac, {}).get("ip"),
+                           "reservation_ip":
+                           reservations.get(mac, {}).get("ip")},
+                 "learned": dict(st.learned), "report": {}}
+        if st.skip > 0:
+            st.skip -= 1
+            entry["state"] = "down"
+            entry["detail"] = f"in backoff ({st.skip} cycles left)"
+            entry["checked_at"] = None
+            out_nodes.append(entry)
+            continue
+
+        report_url = "http://" + host_of(n.get("url", "")) + "/json/report"
+        t0 = time.monotonic()
+        state, detail = None, ""
+        try:
+            status, body = fetch(report_url)
+            rtt = int((time.monotonic() - t0) * 1000)
+            entry["rtt_ms"] = rtt
+            if status == 200 and isinstance(body, dict):
+                state = "healthy"
+                detail = f"reachable (/json/report, {rtt/1000:.1f}s)"
+                st.fails = 0
+                flat = {}
+                def flatten(d, out):
+                    for k, v in d.items():
+                        if isinstance(v, dict):
+                            flatten(v, out)
+                        else:
+                            out[k] = v
+                flatten(body, flat)
+                entry["report"] = {k: flat[k] for k in REPORT_FIELDS
+                                   if k in flat}
+            else:
+                state = "unknown"
+                detail = f"report answered {status} without usable JSON"
+        except Exception:
+            cls, alert = classify_failure(n, alive_peers)
+            if cls:
+                state, detail = cls, alert
+                st.fails = 0
+            else:
+                tid = st.learned.get("id")
+                if tid:
+                    peer, heard = peer_heard(tid, alive_peers)
+                    if peer:
+                        state = "wifi-down"
+                        detail = (f"IP-unreachable but {peer} heard "
+                                  f"{tid} on LoRa (last_heard {heard})")
+                if state is None:
+                    state = "down"
+                    detail = "unreachable over IP; no peer evidence"
+                st.fails += 1
+                st.skip = 2 ** min(st.fails, 3)
+
+        # deep poll: first sight or every Nth successful cycle
+        if state == "healthy" and (not st.learned
+                                   or st.cycles % cfg["diag_every"] == 0):
+            try:
+                _, diag = fetch(n["url"] + "/api/diag", n.get("token"))
+                _, settings = fetch(n["url"] + "/api/settings",
+                                    n.get("token"))
+                if isinstance(diag, dict):
+                    # real shape (captured 2026-08-05): data.device.
+                    # reboot_count, data.power.battery_percent
+                    d = diag.get("data", diag)
+                    dev = d.get("device", {})
+                    pwr = d.get("power", {})
+                    prev_rc = st.learned.get("reboot_count")
+                    rc = dev.get("reboot_count")
+                    if prev_rc is not None and rc is not None and rc > prev_rc:
+                        state = "stale"
+                        entry["alerts"].append(
+                            f"rebooted since last poll ({prev_rc} -> {rc})")
+                    st.learned["reboot_count"] = rc
+                    st.learned["battery_pct"] = pwr.get("battery_percent")
+                    nid = (dev.get("node_id") or dev.get("id")
+                           or d.get("mesh", {}).get("my_id"))
+                    if nid:
+                        st.learned["id"] = nid
+                    st.learned["last_diag_at"] = now
+                if isinstance(settings, dict):
+                    st.interval = learned_interval(settings)
+            except Exception:
+                entry["alerts"].append("deep poll failed; cheap path fine")
+
+        iv = n.get("expected_interval_s") or st.interval
+        entry["expected_interval_s"] = iv
+        entry["stale_after_s"] = HOLD_MULTIPLIER * iv
+        # the bench trap, cross-checked with gateway-side evidence
+        if (entry["assoc"]["associated"] and entry["assoc"]["lease_ip"]
+                and state == "down"):
+            entry["alerts"].append(
+                "associated on halow0 with a lease but IP-unreachable — "
+                "the associated-but-answers-no-ARP trap")
+        entry["state"] = state
+        entry["detail"] = detail
+        entry["learned"] = dict(st.learned)
+        entry["consecutive_failures"] = st.fails
+        out_nodes.append(entry)
+        if state == "healthy":
+            alive_peers.append(n)
+
+    # unknown stations: on the radio or in leases, in no store
+    known_macs = ({(n.get("mac") or "").lower() for n in nodes}
+                  | set(load_reservations()))
+    unknown = []
+    for mac in assoc | set(leases):
+        if mac and mac not in known_macs:
+            le = leases.get(mac, {})
+            unknown.append({"mac": mac, "first_seen": now,
+                            "lease_ip": le.get("ip"),
+                            "lease_host": le.get("host"),
+                            "associated": mac in assoc,
+                            "proposed": {"reservation_ip": le.get("ip"),
+                                         "name": f"node{len(nodes) + 1}"}})
+    return out_nodes, unknown
+
+
+def main():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    states = {}
+    while True:
+        cfg = envcfg()
+        start = time.time()
+        try:
+            nodes_out, unknown = poll_cycle(states, cfg, int(start))
+            cache = {"t": int(start), "interval_s": cfg["interval"],
+                     "nodes": nodes_out, "unknown_stations": unknown}
+            atomic_write(CACHE, json.dumps(cache, indent=1))
+            with open(HISTORY, "a") as f:
+                for n in nodes_out:
+                    f.write(json.dumps({"t": int(start), "name": n["name"],
+                                        "state": n["state"],
+                                        "rtt_ms": n["rtt_ms"]}) + "\n")
+            try:
+                lines = open(HISTORY).readlines()
+                if len(lines) > RING_LINES + 200:
+                    atomic_write(HISTORY, "".join(lines[-RING_LINES:]))
+            except OSError:
+                pass
+        except Exception as e:
+            subprocess.run(["logger", "-t", "halow-watch",
+                            f"cycle failed: {e.__class__.__name__}: {e}"])
+        # sleep to the next interval boundary; cycles never overlap
+        elapsed = time.time() - start
+        time.sleep(max(5, cfg["interval"] - elapsed))
+
+
+if __name__ == "__main__":
+    main()

@@ -1304,6 +1304,25 @@ def node_get(node, path):
 @app.get("/api/nodes")
 @authed
 def api_nodes():
+    """Cached fleet view from halow-watch — a file read, zero node
+    contact (each live fetch costs a node 5-6s and one of ~6 TLS
+    sessions [M]; two sessions once reset a node). ?live=1 keeps the
+    old serial fetch as a deliberate operator action. watcher_stale is
+    computed HERE from the cache's own t — a dead watcher must never
+    look like a healthy fleet."""
+    if request.args.get("live") != "1":
+        try:
+            cache = json.load(open("/var/lib/halow/nodewatch.json"))
+        except Exception:
+            return jsonify({"nodes": [], "cached": True,
+                            "watcher_stale": True,
+                            "error": "no watcher cache yet — is "
+                            "halow-watch running?"})
+        age = max(0, int(time.time() - cache.get("t", 0)))
+        cache["cached"] = True
+        cache["age_s"] = age
+        cache["watcher_stale"] = age > 3 * cache.get("interval_s", 120)
+        return jsonify(cache)
     try:
         with open(NODES_CONF) as f:
             nodes = json.load(f)["nodes"]
@@ -1319,7 +1338,54 @@ def api_nodes():
             entry["reachable"] = False
             entry["error"] = str(e)
         out.append(entry)
-    return jsonify({"nodes": out})
+    return jsonify({"nodes": out, "cached": False})
+
+
+@app.post("/api/config/nodes")
+@authed
+def api_config_nodes():
+    op = request.form.get("op", "add")
+    if op == "add":
+        args = ["node", "add", f"name={request.form.get('name', '')}"]
+        for k in ("mac", "url", "interval"):
+            if request.form.get(k):
+                args.append(f"{k}={request.form.get(k)}")
+        # token write-only via stdin — never argv, never echoed
+        ok, o = halowctl(args, stdin=request.form.get("token", ""))
+    elif op == "del":
+        sel = (f"name={request.form.get('name')}" if request.form.get("name")
+               else f"mac={request.form.get('mac', '')}")
+        ok, o = halowctl(["node", "del", sel])
+    else:
+        return jsonify({"error": "op must be add or del"}), 400
+    return (jsonify({"ok": True, "output": o}) if ok
+            else (jsonify({"error": o}), 500))
+
+
+@app.post("/api/nodes/adopt")
+@authed
+def api_nodes_adopt():
+    """One click: unknown associated MAC -> dnsmasq reservation +
+    nodes.json entry. Token defaults to the one existing entries share
+    (the bench runs one operator credential)."""
+    import re as _re
+    mac = request.form.get("mac", "").lower()
+    ip = request.form.get("ip", "")
+    name = request.form.get("name", "")
+    if not _re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+        return jsonify({"error": "bad mac"}), 400
+    if not _re.fullmatch(r"10\.117\.0\.\d{1,3}", ip):
+        return jsonify({"error": "ip must be 10.117.0.x"}), 400
+    if not _re.fullmatch(r"[A-Za-z0-9-]+", name):
+        return jsonify({"error": "bad name"}), 400
+    ok1, o1 = halowctl(["dhcp-reserve", "add", f"mac={mac}", f"ip={ip}",
+                        f"name={name}"])
+    url = request.form.get("url", f"https://{ip}")
+    ok2, o2 = halowctl(["node", "add", f"name={name}", f"mac={mac}",
+                        f"url={url}"], stdin=request.form.get("token", ""))
+    if ok1 and ok2:
+        return jsonify({"ok": True, "output": f"{o1}\n{o2}"})
+    return jsonify({"error": f"reserve: {o1}\nnode: {o2}"}), 500
 
 
 @app.get("/api/nodes/<name>/<path:sub>")
@@ -1831,19 +1897,51 @@ async function router(){const r=await j("/api/router");
  <div class="card"><h2>firewall / NAT</h2><pre>${esc(r.nft)}</pre></div>
  <div class="card"><h2>routes</h2><pre>${esc(r.routes.map(x=>`${x.dst||"default"} via ${x.gateway||"-"} dev ${x.dev}`).join("\n"))}</pre></div>`}
 async function nodes(){const d=await j("/api/nodes");
- if(d.error)return `<p class="warn">${esc(d.error)}</p>`;
- return d.nodes.map(n=>{if(!n.reachable)return `<div class="card"><h2>${esc(n.name)}</h2>
-  <p class="bad">unreachable: ${esc(n.error)}</p></div>`;
-  const dg=n.diag;return `<div class="card"><h2>${esc(n.name)} — <span class="ok">reachable</span></h2>
-  <pre>${esc(JSON.stringify(dg,null,1).slice(0,2000))}</pre>
-  <p>${["mesh","metrics","routes","power"].map(p=>
-   `<button class="act" onclick="nodeView('${esc(n.name)}','${p}')">${p}</button>`).join(" ")}</p>
-  <pre id="nv-${esc(n.name)}"></pre></div>`}).join("")}
-async function nodeView(n,p){const el=document.getElementById("nv-"+n);
- el.textContent="loading…";try{const d=await j(`/api/nodes/${n}/${p}`);
- el.textContent=JSON.stringify(d,null,1).slice(0,4000)}catch(e){el.textContent="error: "+e}}
+ if(d.error&&!d.nodes.length)return `<p class="warn">${esc(d.error)}</p>`;
+ const scls=s=>s==="healthy"?"ok":(s==="stale"||s==="unknown"||s==="wifi-down")?"warn":"bad";
+ const banner=d.watcher_stale?`<div class="card"><p class="bad">WATCHER STALE —
+  cache is ${d.age_s??"?"}s old (3× the poll interval). A dead watcher must not look
+  like a healthy fleet: check /api/logs?unit=halow-watch.</p></div>`:"";
+ const rows=(d.nodes||[]).map(n=>{
+  const L=n.learned||{},A=n.assoc||{};
+  return `<tr><td>${esc(n.name)}</td>
+   <td class="${scls(n.state)}">${esc(n.state)}</td>
+   <td>${esc(n.mac||"—")}</td>
+   <td>${A.associated?'<span class="ok">yes</span>':(A.reservation_ip?'reserved':'—')}</td>
+   <td>${L.battery_pct??"—"}</td><td>${L.reboot_count??"—"}</td>
+   <td>${n.rtt_ms!=null?n.rtt_ms+"ms":"—"}</td>
+   <td>${n.checked_at?Math.max(0,Math.round(Date.now()/1000-n.checked_at))+"s":"—"}</td>
+   <td>${esc(n.detail||"")}${(n.alerts||[]).map(a=>` · <span class="warn">${esc(a)}</span>`).join("")}</td>
+   <td><button class="act" onclick="nodeLive('${esc(n.name)}')">live</button></td></tr>`}).join("")
+  ||`<tr><td colspan=10 class="warn">no nodes configured</td></tr>`;
+ const adopt=(d.unknown_stations||[]).map(u=>
+  `<div class="card"><h2>unknown station ${esc(u.mac)}</h2>
+   <p>${u.associated?"associated on halow0":"seen in leases"} · lease ${esc(u.lease_ip||"none")}
+   (${esc(u.lease_host||"?")}). Adopt as
+   name <input id="ad-n-${esc(u.mac.replaceAll(":",""))}" value="${esc(u.proposed.name)}" style="width:80px">
+   ip <input id="ad-i-${esc(u.mac.replaceAll(":",""))}" value="${esc(u.proposed.reservation_ip||"")}" style="width:110px">
+   <button class="act" onclick="adopt('${esc(u.mac)}')">adopt</button></p></div>`).join("");
+ return `${banner}<div class="card"><h2>fleet — cached by halow-watch
+  (age ${d.age_s??"?"}s · poll every ${d.interval_s??"?"}s · viewers never tax the nodes)</h2>
+ <table><tr><th>node</th><th>state</th><th>halow mac</th><th>assoc</th><th>batt</th>
+  <th>reboots</th><th>rtt</th><th>checked</th><th>detail</th><th></th></tr>${rows}</table>
+ <p style="color:var(--dim)">states: healthy · stale (rebooted / silent past 3× its own interval)
+  · wifi-down (a peer still hears it on LoRa) · down · unknown (alive but odd — auth/rate-limit).
+  Live buttons poke the node directly and cost it a TLS session; the table never does.</p></div>
+ ${adopt}<pre id="nv-out"></pre>`}
+async function nodeLive(n){const el=document.getElementById("nv-out");
+ el.textContent="poking "+n+" (costs the node a TLS session)…";
+ try{const d=await j(`/api/nodes/${n}/diag`);
+ el.textContent=n+" /api/diag:\n"+JSON.stringify(d,null,1).slice(0,3000)}
+ catch(e){el.textContent="error: "+e}}
+async function adopt(mac){const k=mac.replaceAll(":","");
+ const fd=new FormData();fd.append("mac",mac);
+ fd.append("name",$("#ad-n-"+k).value);fd.append("ip",$("#ad-i-"+k).value);
+ const r=await(await fetch("/api/nodes/adopt",{method:"POST",body:fd})).json();
+ const el=document.getElementById("nv-out");el.textContent=r.error||r.output;
+ if(!r.error)setTimeout(render,1500)}
 setInterval(()=>{$("#clock").textContent=new Date().toLocaleTimeString()},1000);
-render();setInterval(()=>{if(tab!=="Nodes")render()},15000);
+render();setInterval(render,15000); // Nodes joined the cycle: it is a file read now
 </script></body></html>"""
 
 

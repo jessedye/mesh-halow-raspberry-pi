@@ -54,8 +54,11 @@ sudo usermod -aG video halow-ui 2>/dev/null || true
 # Group halow-ui: the console reads SSID/profile/mode from this file.
 [ -f /etc/halow/halow.env ] || sudo install -m640 -o root -g halow-ui /tmp/halow-deploy/halow.env /etc/halow/
 sudo chgrp halow-ui /etc/halow/halow.env && sudo chmod 640 /etc/halow/halow.env
-# ui.conf and nodes.json are read by the unprivileged UI user
-sudo install -m640 -o root -g halow-ui /tmp/halow-deploy/ui.conf /tmp/halow-deploy/nodes.json /etc/halow/
+# ui.conf is read by the unprivileged UI user
+sudo install -m640 -o root -g halow-ui /tmp/halow-deploy/ui.conf /etc/halow/
+# nodes.json: NEVER clobber a live copy — runtime-adopted nodes (halowctl
+# node add) were silently destroyed by every deploy until 2026-08-05
+[ -f /etc/halow/nodes.json ] || sudo install -m640 -o root -g halow-ui /tmp/halow-deploy/nodes.json /etc/halow/
 rm -rf /tmp/halow-deploy
 sudo install -m644 config/halow-profiles.json config/pinned-scan.json config/nftables-halow.conf /etc/halow/
 sudo install -m644 config/dnsmasq-halow.conf /etc/dnsmasq.d/halow.conf
@@ -76,13 +79,14 @@ sudo sed -i "s/^#host-name=.*/host-name=halow-gw/" /etc/avahi/avahi-daemon.conf
 sudo install -m644 config/99-halow-unmanaged.conf /etc/NetworkManager/conf.d/
 sudo install -m644 config/99-halow-net.rules /etc/udev/rules.d/
 sudo install -m755 scripts/halowctl /usr/local/bin/
-sudo install -m644 systemd/halow-ap.service systemd/halow-net.service systemd/halow-sta.service systemd/halow-ui.service systemd/halow-iperf3.service systemd/halow-sta-events.service systemd/halow-join-watch.service systemd/halow-linkd.service systemd/halow-kernel-guard.service systemd/halow-mon.service systemd/halow-mon.timer /etc/systemd/system/
+sudo install -m644 systemd/halow-ap.service systemd/halow-net.service systemd/halow-sta.service systemd/halow-ui.service systemd/halow-iperf3.service systemd/halow-sta-events.service systemd/halow-join-watch.service systemd/halow-linkd.service systemd/halow-kernel-guard.service systemd/halow-watch.service systemd/halow-mon.service systemd/halow-mon.timer /etc/systemd/system/
 sudo install -m755 scripts/halow-mon /usr/local/bin/
 sudo install -m755 scripts/halow-sta-events /usr/local/bin/
 sudo install -m755 scripts/halow-join-log /usr/local/bin/
 sudo install -m755 scripts/halow-linkd /usr/local/bin/
 sudo install -m755 scripts/halow_rungcost.py /usr/local/bin/
 sudo install -m755 scripts/halow-kernel-guard /usr/local/bin/
+sudo install -m755 scripts/halow-watch /usr/local/bin/
 sudo install -m644 config/apt-halow-kernel-guard /etc/apt/apt.conf.d/99halow-kernel-guard
 sudo mkdir -p /etc/systemd/system.conf.d
 sudo install -m644 config/watchdog-system.conf /etc/systemd/system.conf.d/50-halow-watchdog.conf
@@ -99,7 +103,8 @@ sudo udevadm control --reload
 sudo systemctl daemon-reload
 # [Manager] watchdog keys need a reexec — daemon-reload is not sufficient
 sudo systemctl daemon-reexec
-sudo systemctl enable halow-net halow-ap halow-ui dnsmasq halow-iperf3 halow-sta-events halow-join-watch halow-linkd halow-kernel-guard halow-mon.timer >/dev/null 2>&1
+sudo systemctl enable halow-net halow-ap halow-ui dnsmasq halow-iperf3 halow-sta-events halow-join-watch halow-linkd halow-kernel-guard halow-watch halow-mon.timer >/dev/null 2>&1
+sudo systemctl restart halow-watch || true
 sudo systemctl start halow-kernel-guard || true
 sudo systemctl restart halow-linkd || true
 sudo systemctl restart halow-net halow-ui

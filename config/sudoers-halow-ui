@@ -20,3 +20,4 @@ halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl capture *
 halow-ui ALL=(root) NOPASSWD: /usr/bin/systemctl restart halow-ap
 halow-ui ALL=(root) NOPASSWD: /usr/sbin/reboot
 halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl driver *
+halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl node *

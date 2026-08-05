@@ -1,0 +1,17 @@
+[Unit]
+Description=HaLow fleet health watcher (cached nodewatch; nodes never taxed by viewers)
+After=network.target
+
+[Service]
+Type=simple
+User=halow-ui
+ExecStart=/usr/local/bin/halow-watch
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/halow
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

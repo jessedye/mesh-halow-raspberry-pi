@@ -1,7 +1,9 @@
 {
-  "_doc": "Copy to /etc/halow/nodes.json with the real bearer token (mesh-v4 config/secrets.env ADMIN_TOKEN). Never commit the real file.",
+  "_doc": "Copy to /etc/halow/nodes.json with the real bearer token (mesh-v4 config/secrets.env ADMIN_TOKEN). Never commit the real file. mac = the node's HaLow (MM6108) station MAC as seen by THIS gateway — NOT the ESP32's 2.4 GHz WiFi MAC from mesh-v4 device.env; empty until first association teaches it. expected_interval_s = optional freshness override; null = learn from the node's own /api/settings (firmware silently clamps intervals — the nodewatch lesson). Schema v2, shared with the reach matrix (26) and presence ledger (30). Edited at runtime by 'halowctl node' — deploy.sh never clobbers a live copy.",
   "nodes": [
-    { "name": "node1", "url": "https://192.168.50.103", "token": "CHANGE-ME" },
-    { "name": "node2", "url": "https://192.168.51.104", "token": "CHANGE-ME" }
+    { "name": "node1", "url": "https://192.168.50.103", "token": "CHANGE-ME",
+      "mac": "", "expected_interval_s": null },
+    { "name": "node2", "url": "https://192.168.51.104", "token": "CHANGE-ME",
+      "mac": "", "expected_interval_s": null }
   ]
 }

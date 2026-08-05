@@ -40,6 +40,7 @@ chk "hardware watchdog device" ls /dev/watchdog0
 chk "systemd runtime watchdog 15s" sh -c 'systemctl show -p RuntimeWatchdogUSec | grep -E "=15s"'
 # WatchdogTimestampMonotonic nonzero = a pet was RECEIVED, not merely sent
 chk "halow-ui watchdog pet received" sh -c 'v=$(systemctl show halow-ui -p WatchdogTimestampMonotonic --value); [ "${v:-0}" -gt 0 ] && echo "pet at $v"'
+chk "fleet watcher active + cache fresh" sh -c 'systemctl is-active halow-watch >/dev/null && t=$(python3 -c "import json;print(json.load(open(\"/var/lib/halow/nodewatch.json\"))[\"t\"])" 2>/dev/null) && [ $(( $(date +%s) - t )) -lt 400 ] && echo "cache ${t}"'
 echo
 journalctl -k -q --no-pager -g "morse" -n 10
 exit $fail

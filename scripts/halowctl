@@ -288,6 +288,92 @@ PY
     shift
     exec /usr/local/bin/halow-join-log "$@"
     ;;
+  node)
+    NJ=/etc/halow/nodes.json
+    sub=${2:-list}
+    case "$sub" in
+      list)
+        sudo python3 - <<'PY'
+import json
+try:
+    d = json.load(open("/etc/halow/nodes.json"))
+except Exception:
+    print("no nodes.json"); raise SystemExit(0)
+print(f"{'NAME':10} {'URL':28} {'MAC':18} {'INTERVAL':>9} TOKEN")
+for n in d.get("nodes", []):
+    iv = n.get("expected_interval_s")
+    print(f"{n.get('name',''):10} {n.get('url',''):28} "
+          f"{n.get('mac') or '-':18} {str(iv) if iv else 'learn':>9} "
+          f"{'(set)' if n.get('token') else '(unset)'}")
+PY
+        ;;
+      add)
+        shift 2
+        # token on stdin, never argv (visible in ps) — the set-passphrase
+        # pattern. Empty stdin keeps/reuses the token existing entries share.
+        TOK=$(head -c 256)
+        sudo env ARGS="$*" NEWTOK="$TOK" python3 - <<'PY'
+import json, os, re, sys
+p = "/etc/halow/nodes.json"
+kv = dict(a.split("=", 1) for a in os.environ["ARGS"].split() if "=" in a)
+name, mac = kv.get("name", ""), kv.get("mac", "").lower()
+url = kv.get("url", "")
+if not re.fullmatch(r"[A-Za-z0-9-]+", name):
+    sys.exit("bad name (A-Za-z0-9-)")
+if mac and not re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+    sys.exit("bad mac")
+if url and not re.match(r"^https?://", url):
+    sys.exit("bad url")
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {"nodes": []}
+tok = os.environ.get("NEWTOK", "").strip()
+if not tok:
+    tok = next((n.get("token", "") for n in d["nodes"] if n.get("token")), "")
+entry = next((n for n in d["nodes"] if n.get("name") == name), None)
+if entry is None:
+    entry = {"name": name}
+    d["nodes"].append(entry)
+if url: entry["url"] = url
+if mac: entry["mac"] = mac
+entry.setdefault("mac", "")
+if "interval" in kv:
+    entry["expected_interval_s"] = int(kv["interval"])
+entry.setdefault("expected_interval_s", None)
+if tok: entry["token"] = tok
+tmp = p + ".tmp"
+open(tmp, "w").write(json.dumps(d, indent=1))
+os.chmod(tmp, 0o640)
+os.replace(tmp, p)
+print(f"node {name} upserted ({len(d['nodes'])} configured)")
+PY
+        sudo chgrp halow-ui "$NJ" 2>/dev/null
+        ;;
+      del)
+        shift 2
+        sudo env ARGS="$*" python3 - <<'PY'
+import json, os, sys
+p = "/etc/halow/nodes.json"
+kv = dict(a.split("=", 1) for a in os.environ["ARGS"].split() if "=" in a)
+d = json.load(open(p))
+before = len(d["nodes"])
+d["nodes"] = [n for n in d["nodes"]
+              if not (n.get("name") == kv.get("name")
+                      or (kv.get("mac") and n.get("mac") == kv["mac"].lower()))]
+if len(d["nodes"]) == before:
+    sys.exit("no matching node")
+tmp = p + ".tmp"
+open(tmp, "w").write(json.dumps(d, indent=1))
+os.chmod(tmp, 0o640)
+os.replace(tmp, p)
+print(f"deleted ({len(d['nodes'])} remain)")
+PY
+        sudo chgrp halow-ui "$NJ" 2>/dev/null
+        ;;
+      *) echo "usage: halowctl node list|add name= [mac=] [url=] [interval=]|del name=|mac= (token on stdin for add)"; exit 1 ;;
+    esac
+    ;;
   driver)
     sub=${2:-status}
     case "$sub" in
