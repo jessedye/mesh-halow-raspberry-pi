@@ -58,3 +58,11 @@ sudo reboot
   the `halow0` device unit and will start itself the moment the probe
   succeeds. Temporary MISO hexdump still in the on-Pi driver copy
   (`~/halow/morse_driver/spi.c`) — remove after first contact.
+
+## Disaster recovery
+
+`prebuilt/` holds the compiled artifacts for the pinned kernel
+(`6.18.39+rpt-rpi-v8`): `morse.ko` (unstripped), `dot11ah.ko`, and
+`s1g-bins.tar.gz` (hostapd/wpa_supplicant S1G + morse_cli). A fresh SD
+card needs only Pi OS + `scripts/install.sh` (which rebuilds), or these
+binaries dropped in place for a minutes-long restore on the same kernel.
