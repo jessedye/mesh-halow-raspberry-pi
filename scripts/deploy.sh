@@ -57,7 +57,7 @@ sudo chgrp halow-ui /etc/halow/halow.env && sudo chmod 640 /etc/halow/halow.env
 # ui.conf and nodes.json are read by the unprivileged UI user
 sudo install -m640 -o root -g halow-ui /tmp/halow-deploy/ui.conf /tmp/halow-deploy/nodes.json /etc/halow/
 rm -rf /tmp/halow-deploy
-sudo install -m644 config/halow-profiles.json config/nftables-halow.conf /etc/halow/
+sudo install -m644 config/halow-profiles.json config/pinned-scan.json config/nftables-halow.conf /etc/halow/
 sudo install -m644 config/dnsmasq-halow.conf /etc/dnsmasq.d/halow.conf
 sudo install -m644 config/chrony-halow.conf /etc/chrony/conf.d/halow.conf
 sudo sed -i "s/^#host-name=.*/host-name=halow-gw/" /etc/avahi/avahi-daemon.conf

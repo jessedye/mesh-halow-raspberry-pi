@@ -129,7 +129,15 @@ nothing on the v1 rejected list); verifier corrections are folded in.
     node NVS, so only gateway-side SAE forensics separates wrong-PSK from
     RF-died-mid-handshake. Needs hostapd logger level raised and dnsmasq
     log-dhcp; `GET /api/halow/join-log/<mac>`. [medium/high]
-17. **Pinned-scan compatibility guard** — the node STA pins 926 MHz @4 MHz
+17. **Pinned-scan compatibility guard** — DONE 2026-08-05 (halowctl
+    check-compat + guard on set/set-profile/ssid, GET /api/halow/compat,
+    UI badges + preflight confirms, STRANDS-PINNED tags, fail-closed on
+    missing pinned file or non-US country; 20/20 CLI + 9/9 API acceptance
+    on the Pi, verify.sh 9/9 after; both node HaLow MACs reserved so the
+    guard is armed before first join — node1's MAC is derived [C], confirm
+    at first boot. Incidental fix: `halowctl status` kernel-orphan warning
+    false-fired on every boot — `ls A* B*` fails when either glob is
+    empty; now compgen). — the node STA pins 926 MHz @4 MHz
     plus 1 MHz at 924/925/926/927; three of our four profiles (long-range
     ch45=924.5 @1 MHz, mid-range ch46 @2 MHz, max-rate ch44 @8 MHz) leave
     that set and silently strand every station, indistinguishable from the

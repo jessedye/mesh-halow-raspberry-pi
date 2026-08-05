@@ -2,8 +2,9 @@
 # halowctl — HaLow AP control for the Pi gateway.
 #   halowctl status            chip, interface, AP state, stations
 #   halowctl profiles          list tuning profiles and the active one
-#   halowctl set-profile NAME  switch profile (regenerates conf, restarts AP)
-#   halowctl set KEY=VAL ...   override channel=N width=M ssid=S (persisted)
+#   halowctl check-compat [profile=N|channel=N width=M ssid=S]  pinned-set verdicts (read-only JSON)
+#   halowctl set-profile NAME [confirm=1]  switch profile (guarded: refuses off-pinned-set retunes while stations/reservations exist)
+#   halowctl set KEY=VAL ... [confirm=1]   override channel=N width=M ssid=S (persisted; same guard)
 #   halowctl gen               regenerate hostapd conf from env+profile
 #   halowctl stations          associated STA dump
 #   halowctl mode ap|sta       broadcast the SSID, or join it as a station
@@ -43,6 +44,127 @@ resolve() { # -> CH OP WIDTH PRIM
       *) echo "width must be 1|2|4|8"; exit 1;;
     esac
   fi
+}
+
+# Pinned-scan guard: the ESP32 STAs scan only the five (freq,width) pairs in
+# /etc/halow/pinned-scan.json. Compatibility is frequency+width, NEVER channel
+# number (the node's 1 MHz grid is integer-MHz; the US regdb's is x.5 MHz).
+# Mode 0 prints the full JSON verdict; mode 1 (guard) is silent on pass and
+# prints a refusal + exit 4 when the candidate leaves the pinned set while
+# stations or reservations exist. Missing pinned file / non-US = fail closed.
+compat_check() { # compat_check 0|1 [profile=N] [channel=N] [width=M] [ssid=S]
+  local mode=$1; shift
+  local stations res
+  stations=$(iw dev "${HALOW_IF:-halow0}" station dump 2>/dev/null | grep -c '^Station' || true)
+  res=$(grep -c '^dhcp-host=' /etc/dnsmasq.d/halow-reservations.conf 2>/dev/null || true)
+  env CUR_PROFILE="${HALOW_PROFILE:-}" CUR_CHANNEL="${HALOW_CHANNEL:-}" \
+      CUR_WIDTH="${HALOW_WIDTH:-}" CUR_SSID="${HALOW_SSID:-}" \
+      CUR_COUNTRY="${HALOW_COUNTRY:-US}" STATIONS="$stations" \
+      RESERVATIONS="$res" GUARD="$mode" \
+      python3 - "$PROFILES" /etc/halow/pinned-scan.json "$@" <<'PY'
+import json, os, sys
+
+profiles_path, pinned_path = sys.argv[1], sys.argv[2]
+args = dict(a.split("=", 1) for a in sys.argv[3:] if "=" in a)
+guard = os.environ.get("GUARD") == "1"
+stations = int(os.environ.get("STATIONS") or 0)
+reservations = int(os.environ.get("RESERVATIONS") or 0)
+armed = stations > 0 or reservations > 0
+country = (os.environ.get("CUR_COUNTRY") or "US").strip() or "US"
+
+err = None
+pinned_pairs, pinned_ssid = [], None
+try:
+    pj = json.load(open(pinned_path))
+    pinned_pairs = [(float(c["centre_freq_mhz"]), int(c["width_mhz"]))
+                    for c in pj["channels"]]
+    pinned_ssid = pj.get("ssid")
+except Exception as e:
+    err = f"pinned set unavailable ({pinned_path}: {e.__class__.__name__})"
+if err is None and country != "US":
+    err = f"country {country} != US: no frequency math for the pinned set"
+
+prof = json.load(open(profiles_path))
+cur_prof = os.environ.get("CUR_PROFILE") or prof["default"]
+
+def freq(ch):
+    return 902.0 + 0.5 * ch  # verified against every US regdb row [M]
+
+def effective(profile=None, channel=None, width=None):
+    p = profile or cur_prof
+    ch, w = int(prof["profiles"][p]["channel"]), int(prof["profiles"][p]["width_mhz"])
+    if profile is None:  # current state: env overrides win (resolve() precedence)
+        if os.environ.get("CUR_CHANNEL"): ch = int(os.environ["CUR_CHANNEL"])
+        if os.environ.get("CUR_WIDTH"):   w = int(os.environ["CUR_WIDTH"])
+    if channel is not None: ch = int(channel)
+    if width is not None:   w = int(width)
+    return ch, w
+
+def grid(width):
+    return "/".join(f"{pf:g}" for pf, pw in pinned_pairs if pw == width)
+
+def verdict(ch, w, ssid):
+    if err:
+        return False, err
+    f = freq(ch)
+    if not any(abs(f - pf) < 0.001 and w == pw for pf, pw in pinned_pairs):
+        return False, (f"{f:g} MHz @ {w} MHz not in pinned set "
+                       f"(1 MHz grid: {grid(1)}; 4 MHz: {grid(4)})")
+    if ssid is not None and pinned_ssid and ssid != pinned_ssid:
+        return False, f"ssid '{ssid}' != pinned ssid '{pinned_ssid}'"
+    return True, ""
+
+out = {"presence": {"stations": stations, "reservations": reservations,
+                    "guard_armed": armed},
+       "profiles": {}}
+for name, p in prof["profiles"].items():
+    ch, w = int(p["channel"]), int(p["width_mhz"])
+    ok, _ = verdict(ch, w, None)
+    out["profiles"][name] = {"channel": ch, "width_mhz": w,
+                             "centre_freq_mhz": freq(ch), "compatible": ok}
+ach, aw = effective()
+aok, _ = verdict(ach, aw, None)
+out["active"] = {"profile": cur_prof, "channel": ach, "width_mhz": aw,
+                 "centre_freq_mhz": freq(ach), "compatible": aok}
+
+cand_ok, reason, desc = True, "", ""
+if args:
+    try:
+        if "profile" in args:
+            name = args["profile"]
+            if name not in prof["profiles"]:
+                raise ValueError(f"unknown profile {name}")
+            ch, w = effective(profile=name)
+            desc = f"{name} ({freq(ch):g} MHz @ {w} MHz)"
+        else:
+            ch, w = effective(channel=args.get("channel"), width=args.get("width"))
+            desc = f"channel {ch} ({freq(ch):g} MHz @ {w} MHz)"
+        cand_ok, reason = verdict(ch, w, args.get("ssid"))
+        if args.get("ssid") is not None:
+            desc += f" ssid '{args['ssid']}'"
+        cand = {"channel": ch, "width_mhz": w, "centre_freq_mhz": freq(ch),
+                "compatible": cand_ok}
+        if "profile" in args: cand["profile"] = args["profile"]
+        if args.get("ssid") is not None: cand["ssid"] = args["ssid"]
+        if not cand_ok: cand["reason"] = reason
+        out["candidate"] = cand
+    except (ValueError, KeyError) as e:
+        cand_ok, reason = False, f"invalid candidate: {e}"
+        desc = " ".join(f"{k}={v}" for k, v in args.items())
+        out["candidate"] = {"compatible": False, "reason": reason}
+
+if guard:
+    if args and not cand_ok and armed:
+        sys.stderr.write(
+            f"REFUSED: {desc}: {reason}.\n"
+            f"{stations} station(s) associated, {reservations} reservation(s) on"
+            " file: applying this strands every pinned ESP32 STA with symptoms"
+            " identical to a dead radio (/etc/halow/pinned-scan.json).\n"
+            "Re-run with confirm=1 to apply anyway.\n")
+        sys.exit(4)
+    sys.exit(0)
+print(json.dumps(out, indent=1))
+PY
 }
 
 gen() {
@@ -88,29 +210,62 @@ case "${1:-status}" in
   gen) gen ;;
   profiles)
     active=${HALOW_PROFILE:-$(jqp "d['default']")}
-    python3 - "$PROFILES" "$active" <<'PY'
+    python3 - "$PROFILES" "$active" /etc/halow/pinned-scan.json <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1])); act=sys.argv[2]
+try:
+    pj=json.load(open(sys.argv[3]))
+    pin=[(float(c["centre_freq_mhz"]),int(c["width_mhz"])) for c in pj["channels"]]
+except Exception:
+    pin=None
 for n,p in d['profiles'].items():
     m=' *' if n==act else '  '
-    print(f"{m}{n:11s} {p['width_mhz']}MHz ch{p['channel']:>3} op{p['op_class']}  {p['phy_note']}")
+    tag=''
+    if pin is not None:
+        f=902.0+0.5*p['channel']
+        if not any(abs(f-pf)<0.001 and int(p['width_mhz'])==pw for pf,pw in pin):
+            tag='  STRANDS-PINNED'
+    print(f"{m}{n:11s} {p['width_mhz']}MHz ch{p['channel']:>3} op{p['op_class']}  {p['phy_note']}{tag}")
 PY
     ;;
+  check-compat)
+    shift
+    compat_check 0 "$@"
+    ;;
   set-profile)
-    n=${2:?usage: halowctl set-profile NAME}
+    n=${2:?usage: halowctl set-profile NAME [confirm=1]}
     jqp "d['profiles']['$n']" >/dev/null || { echo "unknown profile $n"; exit 1; }
+    if [ "${3:-}" != "confirm=1" ]; then
+      compat_check 1 "profile=$n" || exit 4
+    fi
     sudo sed -i "s/^HALOW_PROFILE=.*/HALOW_PROFILE=$n/; s/^HALOW_CHANNEL=.*/HALOW_CHANNEL=/; s/^HALOW_WIDTH=.*/HALOW_WIDTH=/" "$ENV"
     sudo "$0" gen && sudo systemctl restart halow-ap
     ;;
   set)
     shift
+    confirm=0; pairs=()
     for kv in "$@"; do
+      case "$kv" in
+        confirm=1) confirm=1 ;;                 # consumed, never persisted
+        *) pairs+=("$kv") ;;
+      esac
+    done
+    [ ${#pairs[@]} -gt 0 ] || { echo "usage: halowctl set channel=N|width=M|ssid=S [confirm=1]"; exit 1; }
+    for kv in "${pairs[@]}"; do
+      case "${kv%%=*}" in
+        channel|width|ssid) ;;
+        *) echo "unknown key ${kv%%=*} (channel|width|ssid)"; exit 1;;
+      esac
+    done
+    if [ "$confirm" != 1 ]; then
+      compat_check 1 "${pairs[@]}" || exit 4
+    fi
+    for kv in "${pairs[@]}"; do
       k=${kv%%=*}; v=${kv#*=}
       case "$k" in
         channel) sudo sed -i "s/^HALOW_CHANNEL=.*/HALOW_CHANNEL=$v/" "$ENV";;
         width)   sudo sed -i "s/^HALOW_WIDTH=.*/HALOW_WIDTH=$v/" "$ENV";;
         ssid)    sudo sed -i "s/^HALOW_SSID=.*/HALOW_SSID=$v/" "$ENV";;
-        *) echo "unknown key $k (channel|width|ssid)"; exit 1;;
       esac
     done
     sudo "$0" gen && sudo systemctl restart halow-ap
@@ -197,6 +352,7 @@ PY
     REPO=${2:-/home/pi/mesh-halow-raspberry-pi}
     rc=0
     for pair in "config/halow-profiles.json:/etc/halow/halow-profiles.json" \
+                "config/pinned-scan.json:/etc/halow/pinned-scan.json" \
                 "config/nftables-halow.conf:/etc/halow/nftables-halow.conf" \
                 "config/morse.conf:/etc/modprobe.d/morse.conf"; do
       r="$REPO/${pair%%:*}"; l="${pair#*:}"
@@ -214,7 +370,8 @@ PY
   snapshot)
     D=/var/lib/halow/config-snapshot-$(date +%Y%m%d-%H%M%S)
     sudo mkdir -p "$D"
-    sudo cp /etc/halow/halow.env /etc/halow/halow-profiles.json /etc/halow/nftables-halow.conf \
+    sudo cp /etc/halow/halow.env /etc/halow/halow-profiles.json /etc/halow/pinned-scan.json \
+            /etc/halow/nftables-halow.conf \
             /etc/halow/forwards.json /etc/modprobe.d/morse.conf /etc/dnsmasq.d/halow*.conf "$D/" 2>/dev/null
     sudo chmod 700 "$D"
     echo "snapshot: $D (root-only; includes secrets — never copy into the repo)"
@@ -361,7 +518,10 @@ for r in json.load(open("/etc/halow/forwards.json")):
   stop) sudo systemctl stop halow-ap ;;
   status)
     K=$(uname -r)
-    ls "/lib/modules/$K/updates/morse.ko"* "/lib/modules/$K/extra/morse.ko"* >/dev/null 2>&1 || \
+    # compgen, not ls: 'ls A* B*' fails when EITHER glob is empty, and the
+    # module lives only in updates/ — that false-fired on every healthy boot.
+    compgen -G "/lib/modules/$K/updates/morse.ko*" >/dev/null || \
+    compgen -G "/lib/modules/$K/extra/morse.ko*" >/dev/null || \
       echo "!! NO morse.ko FOR RUNNING KERNEL $K — a kernel upgrade orphaned the driver; run install.sh --driver-only (or --prebuilt) BEFORE the next reboot"
     echo "== interface"; ip -br addr show "${HALOW_IF:-halow0}" 2>/dev/null || echo "  ${HALOW_IF:-halow0}: ABSENT (driver not probed?)"
     echo "== AP service"; systemctl is-active halow-ap 2>/dev/null || true

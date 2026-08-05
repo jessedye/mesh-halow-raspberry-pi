@@ -1,0 +1,25 @@
+{
+  "_doc": [
+    "The ESP32 nodes' pinned HaLow scan set - what a station can actually find.",
+    "Compatibility is frequency+width, NEVER channel number: the node list",
+    "uses integer-MHz 1 MHz channels (44/46/48/50) while the Pi US regdb 1 MHz",
+    "grid is odd 1-51 at x.5 MHz. If the node firmware repins, update this",
+    "file and redeploy - nothing else changes."
+  ],
+  "ssid": "mesh",
+  "source": {
+    "repo": "mesh-v4",
+    "files": [
+      "firmware/halow/component-2.11.2/sta-diagnostic-app_main.c bench_get_channel_list() lines 75-90",
+      "firmware/halow/pio-library/halow_transport-step-c.cpp lines 49-64"
+    ],
+    "captured": "2026-08-05"
+  },
+  "channels": [
+    {"centre_freq_mhz": 926.0, "width_mhz": 4},
+    {"centre_freq_mhz": 924.0, "width_mhz": 1},
+    {"centre_freq_mhz": 925.0, "width_mhz": 1},
+    {"centre_freq_mhz": 926.0, "width_mhz": 1},
+    {"centre_freq_mhz": 927.0, "width_mhz": 1}
+  ]
+}

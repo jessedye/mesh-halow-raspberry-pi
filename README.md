@@ -115,8 +115,18 @@ mesh-v4 token; only its sha256 is stored on the gateway).
 | `POST /api/config/dhcp` | `start`, `end` (10.117.0.x), `lease` (12h), `dns` (csv) |
 | `POST /api/config/forwards` | `op=add\|del`, `proto=tcp\|udp`, `ext`, `dest=10.117.0.x:port` |
 | `POST /api/system/reboot` | `confirm=1` |
-| `POST /api/halow/profile` | `name` (long-range/mid-range/balanced/max-rate) |
+| `POST /api/halow/profile` | `name` (long-range/mid-range/balanced/max-rate); `confirm=1` to override the pinned-scan guard |
+| `GET /api/halow/compat` | — (pinned-set verdicts; optional `profile`/`channel`/`width`/`ssid` candidate) |
 | `POST /api/halow/probe` | — |
+
+**Pinned-scan guard**: the ESP32 nodes scan only five (frequency, width)
+pairs (`config/pinned-scan.json` — 926.0 MHz @ 4 MHz + 924/925/926/927 @
+1 MHz, SSID `mesh`). Profile/channel/width/SSID changes that leave that
+set are refused (exit 4 / HTTP 400) while stations or DHCP reservations
+exist; `confirm=1` overrides. Compatibility is frequency+width, never
+channel number — the node's 1 MHz grid is integer-MHz while the US regdb
+grid is x.5 MHz. If the node firmware repins: update
+`config/pinned-scan.json`, redeploy, done.
 
 All mutations route through `halowctl` subcommands — the sudoers file is
 the complete privileged surface. Passphrases travel on stdin, never argv.

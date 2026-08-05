@@ -226,12 +226,51 @@ def api_halow():
     })
 
 
+@app.get("/api/halow/compat")
+@authed
+def api_halow_compat():
+    """Pinned-set verdicts (halowctl check-compat). Read-only, no sudo:
+    everything the check reads is readable by halow-ui."""
+    import re as _re
+    args = []
+    p = request.args.get("profile")
+    if p:
+        if not _re.match(r"^[A-Za-z0-9-]+$", p):
+            return jsonify({"error": "bad profile name"}), 400
+        args.append(f"profile={p}")
+    for k in ("channel", "width"):
+        v = request.args.get(k)
+        if v:
+            if not v.isdigit():
+                return jsonify({"error": f"{k} must be numeric"}), 400
+            args.append(f"{k}={v}")
+    s = request.args.get("ssid")
+    if s:
+        args.append(f"ssid={s}")
+    try:
+        r = subprocess.run(["/usr/local/bin/halowctl", "check-compat"] + args,
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return jsonify({"error": (r.stdout + r.stderr).strip()}), 502
+        return Response(r.stdout, mimetype="application/json")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
 @app.post("/api/halow/profile")
 @authed
 def api_halow_profile():
+    import re as _re
     name = request.form.get("name", "")
-    ok = sh(f"sudo /usr/local/bin/halowctl set-profile {name} 2>&1", timeout=30)
-    return jsonify({"applied": name, "output": ok})
+    if not _re.match(r"^[A-Za-z0-9-]+$", name):
+        return jsonify({"error": "bad profile name"}), 400
+    args = ["set-profile", name]
+    if request.form.get("confirm") == "1":
+        args.append("confirm=1")
+    ok, out = halowctl(args, timeout=30)
+    if not ok:
+        return jsonify({"error": out}), 400
+    return jsonify({"applied": name, "output": out})
 
 
 @app.post("/api/halow/probe")
@@ -254,12 +293,27 @@ def api_halow_mode():
 @app.post("/api/halow/set")
 @authed
 def api_halow_set():
-    args = []
-    for k in ("channel", "width", "ssid"):
-        v = request.form.get(k)
-        if v:
-            args.append(f"{k}={v}")
-    out = sh("sudo /usr/local/bin/halowctl set " + " ".join(args), timeout=30)
+    args = ["set"]
+    ch = request.form.get("channel")
+    w = request.form.get("width")
+    ssid = request.form.get("ssid")
+    if ch:
+        if not ch.isdigit():
+            return jsonify({"error": "channel must be numeric"}), 400
+        args.append(f"channel={ch}")
+    if w:
+        if not w.isdigit():
+            return jsonify({"error": "width must be numeric"}), 400
+        args.append(f"width={w}")
+    if ssid:
+        args.append(f"ssid={ssid}")
+    if len(args) == 1:
+        return jsonify({"error": "nothing to set"}), 400
+    if request.form.get("confirm") == "1":
+        args.append("confirm=1")
+    ok, out = halowctl(args, timeout=30)
+    if not ok:
+        return jsonify({"error": out}), 400
     return jsonify({"output": out})
 
 
@@ -1195,11 +1249,14 @@ async function monCard(){try{const m=await j("/api/metrics?minutes=1440");
  </div>${(mo.actions&&mo.actions.length)?`<pre>${esc(mo.actions.slice(-5).map(a=>a.at+" "+a.action).join("\n"))}</pre>`:""}</div>`}
  catch(e){return `<div class="card"><h2>monitor</h2><p class="bad">${esc(e)}</p></div>`}}
 async function halow(){const h=await j("/api/halow");
- const profs=Object.entries(h.profiles).map(([n,p])=>
-  `<tr><td>${n===h.profile?"▶":""}</td><td>${esc(n)}</td><td>${p.width_mhz} MHz</td>
-   <td>ch ${p.channel}</td><td>op ${p.op_class}</td>
+ let cc=null;try{cc=await j("/api/halow/compat")}catch(e){}
+ const profs=Object.entries(h.profiles).map(([n,p])=>{
+  const v=cc&&cc.profiles&&cc.profiles[n];
+  const badge=v&&v.compatible===false?'<span class="warn">strands pinned nodes</span>':"";
+  return `<tr><td>${n===h.profile?"▶":""}</td><td>${esc(n)}</td><td>${p.width_mhz} MHz</td>
+   <td>ch ${p.channel}</td><td>op ${p.op_class}</td><td>${badge}</td>
    <td><button class="act" ${n===h.profile?"disabled":""}
-     onclick="setProf('${n}')">apply</button></td></tr>`).join("");
+     onclick="setProf('${n}')">apply</button></td></tr>`}).join("");
  const stas=h.stations.length?h.stations.map(s=>
   `<tr><td>${esc(s.mac)}</td><td>${esc(s.signal||"")}</td><td>${esc(s.tx_bitrate||"")}</td>
    <td>${esc(s.rx_bitrate||"")}</td><td>${esc(s.connected_time||"")}</td></tr>`).join("")
@@ -1210,15 +1267,30 @@ async function halow(){const h=await j("/api/halow");
  <button class="act" onclick="setMode('${h.mode==="ap"?"sta":"ap"}')">Switch to ${h.mode==="ap"?"STA (join mesh)":"AP (broadcast mesh)"}</button></p>
  <pre id="probe-out"></pre></div>
  <div class="card"><h2>profiles — range ⟷ rate</h2>
- <table><tr><th></th><th>profile</th><th>width</th><th>channel</th><th>op class</th><th></th></tr>${profs}</table>
+ <table><tr><th></th><th>profile</th><th>width</th><th>channel</th><th>op class</th><th>node compat</th><th></th></tr>${profs}</table>
  <p style="color:var(--dim)">override: ch <input id="ch" placeholder="${esc(h.channel_override||'auto')}">
  width <input id="w" placeholder="${esc(h.width_override||'auto')}">
  <button class="act" onclick="setOvr()">apply</button>
- — valid US: 1MHz odd 1-51 · 2MHz 2,6..50 · 4MHz 8,16..48 · 8MHz 12,28,44</p></div>
+ — valid US: 1MHz odd 1-51 · 2MHz 2,6..50 · 4MHz 8,16..48 · 8MHz 12,28,44</p>
+ <pre id="halow-out"></pre></div>
  <div class="card"><h2>stations</h2>
  <table><tr><th>mac</th><th>signal</th><th>tx</th><th>rx</th><th>connected</th></tr>${stas}</table></div>`}
-async function setProf(n){const fd=new FormData();fd.append("name",n);
- await fetch("/api/halow/profile",{method:"POST",body:fd});render()}
+async function hpost(u,body){const fd=new FormData();
+ for(const[k,v]of Object.entries(body))if(v!==""&&v!=null)fd.append(k,v);
+ const r=await fetch(u,{method:"POST",body:fd});const d=await r.json();
+ const el=document.getElementById("halow-out");
+ if(el)el.textContent=d.error||d.output||"ok";
+ if(!d.error)setTimeout(render,1200);return d}
+async function preflight(qs){try{const c=await j("/api/halow/compat?"+qs);
+ const cd=c.candidate;if(!cd||cd.compatible!==false)return {};
+ const p=c.presence||{};
+ const armed=p.guard_armed?` — ${p.stations} station(s) / ${p.reservations} reservation(s) will be stranded.`:"";
+ if(!confirm(`${cd.reason||"outside the node pinned scan set"}${armed} Apply anyway?`))return null;
+ return {confirm:1}}catch(e){return {}}}
+async function setProf(n){
+ const extra=await preflight("profile="+encodeURIComponent(n));
+ if(extra===null)return;
+ await hpost("/api/halow/profile",Object.assign({name:n},extra))}
 async function probe(btn){btn.disabled=true;btn.textContent="probing…";
  try{const r=await(await fetch("/api/halow/probe",{method:"POST"})).json();
  const el=document.getElementById("probe-out");
@@ -1227,10 +1299,14 @@ async function setMode(m){const fd=new FormData();fd.append("mode",m);
  await fetch("/api/halow/mode",{method:"POST",body:fd});render()}
 async function wifiAp(s){const fd=new FormData();fd.append("state",s);
  await fetch("/api/router/wifi-ap",{method:"POST",body:fd});setTimeout(render,1500)}
-async function setOvr(){const fd=new FormData();
- if($("#ch").value)fd.append("channel",$("#ch").value);
- if($("#w").value)fd.append("width",$("#w").value);
- await fetch("/api/halow/set",{method:"POST",body:fd});render()}
+async function setOvr(){
+ const ch=$("#ch").value,w=$("#w").value;
+ if(!ch&&!w)return;
+ const qs=[];if(ch)qs.push("channel="+encodeURIComponent(ch));
+ if(w)qs.push("width="+encodeURIComponent(w));
+ const extra=await preflight(qs.join("&"));
+ if(extra===null)return;
+ await hpost("/api/halow/set",Object.assign({channel:ch,width:w},extra))}
 async function router(){const r=await j("/api/router");
  const ifs=r.interfaces.map(i=>{const a=(i.addr_info||[]).map(x=>x.local+"/"+x.prefixlen).join(" ");
   return `<tr><td>${esc(i.ifname)}</td><td class="${i.operstate==='UP'?'ok':'warn'}">${esc(i.operstate)}</td><td>${esc(a)}</td></tr>`}).join("");
