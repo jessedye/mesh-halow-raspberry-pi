@@ -46,6 +46,22 @@ Pi's 3.3 V rail, which shares the PMIC budget with the SD card and onboard
 peripherals — spec guidance for the header's 3V3 pins is ~500 mA combined.
 One module fits; do not hang anything else significant off 3V3.
 
+## Fault localization 2026-08-05 (scripts/wire-census.sh)
+
+Measured on the as-built harness while the probe was failing with MISO
+constant 0xFF:
+
+- Asserting RESET_N (GPIO5 low) drops the module's IRQ drive on GPIO25;
+  releasing it and running a driver probe raises IRQ again. That proves the
+  3V3/GND, RESET, and IRQ wires, module boot, and that probe-time SPI
+  activity reaches the chip (so CLK and CS land on real module inputs).
+- Yet no byte the module sends ever appears on the Pi's MISO (pull-follow
+  0xFF at every clock rate).
+
+Elimination leaves one topology: **the data pair is crossed — swap the
+wires at Pi header pins 19 and 21.** This mirrors the node2 incident on
+the ESP32 bench, where the same cross produced the same perfect silence.
+
 ## Traps already paid for on the ESP32 bring-up (do not rediscover)
 
 - **MISO/MOSI crossed = total, perfect silence.** Commands enter the module's
