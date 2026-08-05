@@ -1,0 +1,119 @@
+--- a/spi.c
++++ b/spi.c
+@@ -14,6 +14,7 @@
+ #include <linux/crc-itu-t.h>
+ #include <linux/spi/spi.h>
+ #include <linux/gpio.h>
++#include <linux/gpio/consumer.h>
+ 
+ #include "morse.h"
+ #include "debug.h"
+@@ -178,6 +179,21 @@
+ MODULE_PARM_DESC(spi_post_write_status_bytes,
+ 		 "Status bytes appended after a byte-mode CMD53 write");
+ 
++/* mesh-v4 bench (2026-08-05, MM6108 rev 0x406 on HT-HC01P): this chip
++ * rejects CMD53 block mode outright (R1=0x04) and deserializes the write
++ * data phase one bit late, so no host CRC can ever match unless the
++ * token+data+crc stream is pre-shifted. Both proven by experiment on two
++ * modules; defaults reflect the working combination.
++ */
++static bool spi_force_byte_mode = true;
++module_param(spi_force_byte_mode, bool, 0644);
++MODULE_PARM_DESC(spi_force_byte_mode,
++		 "Decompose block-mode CMD53 writes into 512B byte-mode chunks");
++static uint spi_write_bit_shift = 1;
++module_param(spi_write_bit_shift, uint, 0644);
++MODULE_PARM_DESC(spi_write_bit_shift,
++		 "Extra fill bits ahead of the write data token (0-7)");
++
+ /* SPI bus edge IRQ compatibility mode */
+ static bool spi_use_edge_irq;
+ module_param(spi_use_edge_irq, bool, 0644);
+@@ -287,6 +303,30 @@
+ static void morse_spi_initsequence(struct morse_spi *mspi)
+ {
+ 	struct spi_device *spi = mspi->spi;
++#if KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE
++	struct gpio_desc *cs_gpiod = spi_get_csgpiod(spi, 0);
++
++	/*
++	 * Unpatched kernels ignore SPI_CS_HIGH for GPIO-descriptor chip
++	 * selects (polarity comes from the DT flag), so the CS_HIGH path
++	 * below clocks the training bytes with CS *asserted* and the chip
++	 * never leaves its pre-SPI state. With SPI_NO_CS the core leaves the
++	 * line alone entirely; parking it logically inactive yields the
++	 * required >=74 clocks with both CS and MOSI high.
++	 */
++	spi->mode |= SPI_NO_CS;
++	if (cs_gpiod && spi_setup(spi) == 0) {
++		gpiod_set_value_cansleep(cs_gpiod, 0);
++		memset(mspi->data, 0xFF, MM610X_BUF_SIZE);
++		morse_spi_xfer(mspi, 18);
++
++		spi->mode &= ~SPI_NO_CS;
++		if (spi_setup(spi) != 0)
++			dev_err(&spi->dev, "can't restore chip-select mode\n");
++		return;
++	}
++	spi->mode &= ~SPI_NO_CS;
++#endif
+ 
+ 	spi->mode |= SPI_CS_HIGH;
+ 	if (spi_setup(spi) != 0) {
+@@ -403,6 +443,9 @@
+ 
+ 	ret = morse_spi_xfer(mspi, buffer_size);
+ 
++	print_hex_dump(KERN_INFO, "morse miso: ", DUMP_PREFIX_OFFSET, 20, 1,
++		       mspi->data, min_t(unsigned int, buffer_size, 20), false);
++
+ 	if (ret)
+ 		return ret;
+ 
+@@ -653,6 +696,20 @@
+ 	u32 data_size;
+ 	int i;
+ 
++	if (block && spi_force_byte_mode) {
++		u32 off;
++
++		for (off = 0; off < (u32)count * MMC_SPI_BLOCKSIZE;
++		     off += MMC_SPI_BLOCKSIZE) {
++			int ret = morse_spi_cmd53_write(mspi, fn, address + off,
++							data + off,
++							MMC_SPI_BLOCKSIZE, 0);
++			if (ret < 0)
++				return ret;
++		}
++		return count;
++	}
++
+ 	memset(mspi->data, 0xFF, MM610X_BUF_SIZE);
+ 	/* Insert command and argument */
+ 	cp += morse_spi_put_cmd53(fn, address, cp, count, 1, block);
+@@ -707,6 +764,24 @@
+ 		*(cp + 1) = (crc & 0xFF);
+ 		cp += sizeof(crc);
+ 
++		/* Pre-shift token+data+crc into a 1-fill: the chip's data-phase
++		 * deserializer runs late by spi_write_bit_shift bits. TX-only
++		 * transform; the ack scan reads RX content post-transfer.
++		 */
++		if (!block && spi_write_bit_shift && spi_write_bit_shift < 8) {
++			u32 n = spi_write_bit_shift;
++			u8 carry = (u8)(0xFF << (8 - n));
++			u8 *q;
++
++			for (q = ack; q <= cp; q++) {
++				u8 orig = *q;
++
++				*q = carry | (orig >> n);
++				carry = (u8)(orig << (8 - n));
++			}
++			cp++;
++		}
++
+ 		/* Allow more bytes for status and chip processing (depends on CLK) */
+ 		if (block)
+ 			cp += mspi->inter_block_delay_bytes;

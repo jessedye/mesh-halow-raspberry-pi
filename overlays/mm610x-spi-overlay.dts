@@ -32,7 +32,7 @@
 				power-gpios = <&gpio 3 0>,
 				              <&gpio 7 0>;
 				spi-irq-gpios = <&gpio 25 0>;
-				spi-max-frequency = <50000000>;
+				spi-max-frequency = <4000000>; /* 50MHz never answered over hand wiring; 4MHz is the bench-proven speed for this module family */
 				status = "okay";
 			};
 
