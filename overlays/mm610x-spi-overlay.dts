@@ -1,0 +1,64 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Morse Micro MM610x (Heltec HT-HC01P) on Raspberry Pi SPI0.
+ * Source: MorseMicro/openwrt 3.1-dev
+ *   target/linux/bcm27xx/patches-6.6/991-0003-dt-overlays-morse-add-spi-overlay-fragment.patch
+ * (archived in patches/; mm810x variant dropped).
+ *
+ * Pin map this encodes (BCM numbering):
+ *   CS=8 (CE0, active-low, software CS)  RESET_N=5  WAKE=3  BUSY=7  IRQ=25
+ * fragment@1 rewrites the base dtb's spi0_cs_pins group to contain ONLY
+ * GPIO8, which releases GPIO7 (normally CE1) for the module's BUSY line.
+ */
+
+/ {
+	compatible = "brcm,bcm2835", "brcm,bcm2836", "brcm,bcm2708", "brcm,bcm2709", "brcm,bcm2711";
+
+	fragment@0 {
+		target = <&spi0>;
+		frag0: __overlay__ {
+			pinctrl-0 = <&spi0_pins &spi0_cs_pins>;
+			cs-gpios = <&gpio 8 1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			mm6108: mm6108@0 {
+				compatible = "morse,mm610x-spi";
+				reg = <0>;	/* CE0 */
+				reset-gpios = <&gpio 5 0>;
+				power-gpios = <&gpio 3 0>,
+				              <&gpio 7 0>;
+				spi-irq-gpios = <&gpio 25 0>;
+				spi-max-frequency = <50000000>;
+				status = "okay";
+			};
+
+			spidev0: spidev@0 {
+				reg = <0>;	/* CE0 */
+				status = "disabled";
+			};
+
+			spidev1: spidev@1 {
+				reg = <1>;	/* CE1 */
+				status = "disabled";
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&gpio>;
+		__overlay__ {
+			spi0_cs_pins: spi0_cs_pins {
+				brcm,pins = <8>;
+				brcm,function = <1>; /* BCM2835_FSEL_GPIO_OUT */
+				brcm,pull = <2>;     /* pull-up */
+			};
+			spi0_pins: spi0_pins {
+				brcm,pull = <2 2 2>; /* pull-up on GPIO 9/10/11 */
+			};
+		};
+	};
+};

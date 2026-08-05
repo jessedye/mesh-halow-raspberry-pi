@@ -1,0 +1,4 @@
+# Append to /boot/firmware/config.txt (under [all]):
+# HT-HC01P WiFi HaLow module on SPI0 — overlay carries the whole pin map.
+# Do NOT add dtparam=i2c_arm=on while the module is wired (GPIO3 = WAKE).
+dtoverlay=mm610x-spi
