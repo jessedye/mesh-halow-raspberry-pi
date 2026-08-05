@@ -14,6 +14,8 @@ chk() { # chk <label> <command...>
   fi
 }
 
+chk "morse.ko exists for RUNNING kernel" \
+    ls "/lib/modules/$(uname -r)/extra/morse.ko"
 chk "overlay loaded (spi0 has mm6108 node)" \
     ls /proc/device-tree/soc/spi@7e204000/mm6108@0/compatible
 chk "morse.ko loaded" sh -c 'lsmod | grep -E "^morse "'

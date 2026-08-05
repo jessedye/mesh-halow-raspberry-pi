@@ -10,12 +10,12 @@ UI/API, recovery — but the clients set a higher bar in three areas:
 
 | # | Finding | Severity |
 |---|---|---|
-| A1 | `prebuilt/morse.ko` still contains the debug MISO hexdump (verified via `strings`) — a restore from it floods the kernel log. Re-capture from the current clean build. | fix now |
-| A2 | The console runs Flask's dev server (`app.run`), single-threaded: one slow node proxy call stalls the whole UI — the mesh-v4 "your own diagnostics are load" lesson applies. Move to waitress (apt: `python3-waitress`). | fix soon |
-| A3 | UI TLS cert has no IP SAN, so browsers warn forever. Regenerate with `subjectAltName=IP:192.168.51.202`. | polish |
+| A1 | ~~prebuilt hexdump~~ FIXED: re-captured clean 2026-08-05 | done |
+| A2 | ~~dev server single-threaded~~ FIXED: threaded=True | done |
+| A3 | ~~no IP SAN~~ FIXED: SAN covers .202, 10.117.0.1, 10.42.0.1, halow-gw.local | done |
 | A4 | Login has a 1 s failure delay but no failure counter/lockout; nodes run a real auth throttle. | recommended |
 | A5 | `halow-sta.service` (STA mode) has never run against a real AP — untested, and the docs should say so until it is. | document |
-| A6 | Kernel upgrades silently orphan `morse.ko` (no DKMS). Nothing detects the mismatch until the AP is dead after a reboot. | needed |
+| A6 | ~~no kernel/module mismatch detection~~ FIXED: verify.sh check + halowctl status warning | done |
 
 ## Needed features (functional gaps for the mesh)
 

@@ -67,7 +67,8 @@ sudo mkdir -p /usr/local/lib && sudo install -m644 ui/halow_ui.py /usr/local/lib
 sudo chgrp halow-ui /etc/halow/ui.conf && sudo chmod 640 /etc/halow/ui.conf
 [ -f /etc/halow/ui-cert.pem ] || sudo openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout /etc/halow/ui-key.pem -out /etc/halow/ui-cert.pem -days 3650 -nodes \
-  -subj "/CN=halow-gw" 2>/dev/null
+  -subj "/CN=halow-gw" \
+  -addext "subjectAltName=IP:192.168.51.202,IP:10.117.0.1,IP:10.42.0.1,DNS:halow-gw.local" 2>/dev/null
 sudo chgrp halow-ui /etc/halow/ui-key.pem /etc/halow/ui-cert.pem && sudo chmod 640 /etc/halow/ui-key.pem
 sudo udevadm control --reload
 sudo systemctl daemon-reload

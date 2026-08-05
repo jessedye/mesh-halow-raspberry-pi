@@ -720,4 +720,5 @@ if __name__ == "__main__":
     if os.path.exists(cert) and os.path.exists(key):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert, key)
-    app.run(host="0.0.0.0", port=8443, ssl_context=ctx)
+    # threaded: a slow node-proxy call must not stall the whole console
+    app.run(host="0.0.0.0", port=8443, ssl_context=ctx, threaded=True)
