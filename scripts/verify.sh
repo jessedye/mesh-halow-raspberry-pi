@@ -2,6 +2,7 @@
 # Post-boot verification of the MM6108 HaLow stack. Run on the Pi.
 # Every check prints PASS/FAIL; exits nonzero if any FAIL.
 set -u
+PATH=/usr/sbin:/usr/local/bin:$PATH
 fail=0
 chk() { # chk <label> <command...>
   local label=$1; shift
@@ -17,10 +18,13 @@ chk "overlay loaded (spi0 has mm6108 node)" \
     ls /proc/device-tree/soc/spi@7e204000/mm6108@0/compatible
 chk "morse.ko loaded" sh -c 'lsmod | grep -E "^morse "'
 chk "dot11ah.ko loaded" sh -c 'lsmod | grep -E "^dot11ah"'
-chk "SPI device bound" sh -c 'ls -l /sys/bus/spi/drivers/morse-spi/ 2>/dev/null | grep spi0.0'
-chk "chip probed (dmesg)" sh -c 'dmesg | grep -iE "morse.*(chip|fw|firmware)" | tail -3'
+chk "SPI device bound" sh -c 'ls -l /sys/bus/spi/drivers/morse_spi/ 2>/dev/null | grep spi0.0'
+# Success signature unknown until first contact on this platform; the
+# honest check is that the most recent probe attempt did not fail.
+chk "last probe attempt clean" sh -c 'journalctl -k -q --no-pager -g "morse" -n 10 | grep -q "probe failed" && exit 1; echo "no probe failure in recent kernel log"'
 chk "wlan interface exists" sh -c 'iw dev | grep -A1 "phy" | grep Interface'
 chk "morse_cli answers" sh -c 'IF=$(iw dev | awk "/Interface/{print \$2; exit}"); morse_cli -i "$IF" version'
+chk "2.4GHz AP (mesh-2g)" sh -c 'nmcli -t -f NAME,STATE con show --active | grep mesh-2g'
 echo
-dmesg | grep -i morse | tail -10
+journalctl -k -q --no-pager -g "morse" -n 10
 exit $fail

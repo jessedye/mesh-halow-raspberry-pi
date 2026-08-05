@@ -134,6 +134,14 @@ PY
     fi
     echo "PROBE OK:"; journalctl -k -q --no-pager -g "morse" -n 6
     ;;
+  wifi-ap)
+    case "${2:-status}" in
+      on)  sudo nmcli con up mesh-2g ;;
+      off) sudo nmcli con down mesh-2g ;;
+      status) nmcli -t -f NAME,DEVICE,STATE con show --active | grep mesh-2g || echo "mesh-2g down" ;;
+      *) echo "usage: halowctl wifi-ap on|off|status"; exit 1 ;;
+    esac
+    ;;
   restart) sudo systemctl restart halow-ap ;;
   stop) sudo systemctl stop halow-ap ;;
   status)

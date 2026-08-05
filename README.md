@@ -27,6 +27,7 @@ giving the mesh-v4 transport ladder its HaLow rung.
 - Pi 4B Rev 1.5 (8 GB), Pi OS Lite 64-bit Trixie, kernel 6.18.39+rpt-rpi-v8
 - `192.168.51.202/23` static on eth0 (gw 192.168.50.1, DNS 1.1.1.1/8.8.8.8), user `pi`
 - HT-HC01P wired per `docs/wiring.md` (Morse HAT-compatible map)
+- Onboard 2.4 GHz WiFi AP `mesh-2g` on wlan0 (NM `shared`, 10.42.0.1/24, same passphrase; toggle: `halowctl wifi-ap on|off`)
 
 ## Quick start (fresh Pi)
 
