@@ -69,10 +69,11 @@ sudo sed -i "s/^#host-name=.*/host-name=halow-gw/" /etc/avahi/avahi-daemon.conf
 sudo install -m644 config/99-halow-unmanaged.conf /etc/NetworkManager/conf.d/
 sudo install -m644 config/99-halow-net.rules /etc/udev/rules.d/
 sudo install -m755 scripts/halowctl /usr/local/bin/
-sudo install -m644 systemd/halow-ap.service systemd/halow-net.service systemd/halow-sta.service systemd/halow-ui.service systemd/halow-iperf3.service systemd/halow-sta-events.service systemd/halow-join-watch.service systemd/halow-mon.service systemd/halow-mon.timer /etc/systemd/system/
+sudo install -m644 systemd/halow-ap.service systemd/halow-net.service systemd/halow-sta.service systemd/halow-ui.service systemd/halow-iperf3.service systemd/halow-sta-events.service systemd/halow-join-watch.service systemd/halow-linkd.service systemd/halow-mon.service systemd/halow-mon.timer /etc/systemd/system/
 sudo install -m755 scripts/halow-mon /usr/local/bin/
 sudo install -m755 scripts/halow-sta-events /usr/local/bin/
 sudo install -m755 scripts/halow-join-log /usr/local/bin/
+sudo install -m755 scripts/halow-linkd /usr/local/bin/
 sudo mkdir -p /var/lib/halow && sudo chown halow-ui:halow-ui /var/lib/halow
 sudo install -m440 config/sudoers-halow-ui /etc/sudoers.d/halow-ui
 sudo mkdir -p /usr/local/lib && sudo install -m644 ui/halow_ui.py /usr/local/lib/
@@ -84,7 +85,8 @@ sudo chgrp halow-ui /etc/halow/ui.conf && sudo chmod 640 /etc/halow/ui.conf
 sudo chgrp halow-ui /etc/halow/ui-key.pem /etc/halow/ui-cert.pem && sudo chmod 640 /etc/halow/ui-key.pem
 sudo udevadm control --reload
 sudo systemctl daemon-reload
-sudo systemctl enable halow-net halow-ap halow-ui dnsmasq halow-iperf3 halow-sta-events halow-join-watch halow-mon.timer >/dev/null 2>&1
+sudo systemctl enable halow-net halow-ap halow-ui dnsmasq halow-iperf3 halow-sta-events halow-join-watch halow-linkd halow-mon.timer >/dev/null 2>&1
+sudo systemctl restart halow-linkd || true
 sudo systemctl restart halow-net halow-ui
 sudo systemctl restart dnsmasq || true
 # The AP only starts once the radio interface exists; harmless to try.

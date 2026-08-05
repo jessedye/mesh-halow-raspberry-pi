@@ -566,7 +566,8 @@ def api_system_reboot():
 THROUGHPUT_LOG = "/var/lib/halow/throughput.jsonl"
 EVENTS_LOG = "/var/lib/halow/station-events.log"
 LOG_UNITS = ("halow-ap", "halow-net", "halow-ui", "halow-sta-events",
-             "halow-join-watch", "halow-iperf3", "dnsmasq", "kernel")
+             "halow-join-watch", "halow-linkd", "halow-iperf3", "dnsmasq",
+             "kernel")
 JOIN_STATE_DIR = "/var/lib/halow/join"
 DISK_LOW_MB = 512  # SD low-water; mirrored in scripts/halow-mon
 
@@ -614,6 +615,94 @@ def api_halow_throughput_history():
     except OSError:
         pass
     return jsonify({"runs": out})
+
+
+LINKTEST_LOG = "/var/lib/halow/linktest.jsonl"
+LINKTEST_STATE = "/var/lib/halow/linktest-state.json"
+
+
+@app.get("/api/halow/linktest")
+@authed
+def api_halow_linktest():
+    """Receiver-counted UDP link-test history + responder state + a
+    24h per-(src,size) aggregate with mesh-v4 n-discipline: n<3 gets raw
+    samples and NO mean; relative spread >0.10 reports the range."""
+    sessions = []
+    try:
+        with open(LINKTEST_LOG) as f:
+            for line in f.readlines()[-50:]:
+                try:
+                    sessions.append(json.loads(line))
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    state = {}
+    try:
+        state = json.load(open(LINKTEST_STATE))
+    except Exception:
+        pass
+    cutoff = time.time() - 86400
+    groups = {}
+    for s in sessions:
+        if s.get("t", 0) >= cutoff:
+            groups.setdefault(f"{s['src_ip']}/{s['size_bytes']}B",
+                              []).append(s)
+    aggregate = {}
+    for key, ss in groups.items():
+        ratios = [s["delivery"]["ratio"] for s in ss]
+        goodputs = [s["goodput_bps"] for s in ss
+                    if s.get("goodput_bps") is not None]
+        entry = {"n": len(ss), "iface": ss[-1]["iface"]}
+        if len(ss) < 3:
+            # n-discipline: no mean below n=3, samples travel instead
+            entry["samples"] = [{"delivery_ratio": r} for r in ratios]
+        else:
+            mean = sum(ratios) / len(ratios)
+            entry["delivery_ratio"] = {"mean": round(mean, 4),
+                                       "min": min(ratios),
+                                       "max": max(ratios)}
+            if goodputs:
+                gmean = sum(goodputs) / len(goodputs)
+                g = {"mean": round(gmean, 1)}
+                if gmean and (max(goodputs) - min(goodputs)) / gmean > 0.10:
+                    g["range"] = [min(goodputs), max(goodputs)]
+                    g["note"] = "spread >10% — the range is the headline"
+                entry["goodput_bps"] = g
+        aggregate[key] = entry
+    return jsonify({"sessions": sessions[::-1], "aggregate": aggregate,
+                    "responder": state})
+
+
+@app.post("/api/halow/linktest/selftest")
+@authed
+def api_halow_linktest_selftest():
+    count = min(int(request.form.get("count", "500")), 1000)
+    size = min(int(request.form.get("size", "200")), 1400)
+    sid = int.from_bytes(os.urandom(4), "little") or 1
+    try:
+        subprocess.run(["/usr/local/bin/halow-linkd", "send",
+                        "--target", "127.0.0.1", "--count", str(count),
+                        "--size", str(size), "--pps", "400",
+                        "--session-id", str(sid)],
+                       capture_output=True, timeout=20)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                for line in open(LINKTEST_LOG):
+                    try:
+                        r = json.loads(line)
+                        if r.get("session_id") == sid:
+                            return jsonify(r)
+                    except Exception:
+                        pass
+            except OSError:
+                pass
+            time.sleep(0.5)
+        return jsonify({"error": "no record within 10s — is halow-linkd "
+                        "running?"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 @app.get("/api/halow/events")
@@ -971,7 +1060,8 @@ def api_diag_bundle():
     """One-shot bundle — the gateway's answer to the nodes' /api/diag."""
     services = {}
     for u in ("halow-ap", "halow-net", "halow-ui", "dnsmasq",
-              "halow-iperf3", "halow-sta-events", "halow-join-watch"):
+              "halow-iperf3", "halow-sta-events", "halow-join-watch",
+              "halow-linkd"):
         services[u] = {
             "active": sh(f"systemctl is-active {u}").strip(),
             "restarts": sh(f"systemctl show -p NRestarts --value {u}").strip(),
@@ -1230,6 +1320,16 @@ async function dLoad(url,label,fmt){const d=await j(url);
  $("#m-out").textContent=`== ${label}\n`+fmt(d)}
 async function debug(){const ev=await j("/api/halow/events"),tp=await j("/api/halow/throughput");
  let jl={stations:{}};try{jl=await j("/api/halow/join-log")}catch(e){}
+ let lt={sessions:[],responder:{}};try{lt=await j("/api/halow/linktest")}catch(e){}
+ const ltrows=lt.sessions.slice(0,8).map(s=>
+  `<tr><td>${new Date(s.t*1000).toISOString().slice(5,19).replace("T"," ")}</td>
+   <td>${esc(s.src_ip)}</td><td>${esc(s.iface)}</td><td>${s.size_bytes}B</td>
+   <td>${s.received_unique}/${s.delivery.sent}</td>
+   <td class="${s.delivery.ratio>=0.95?'ok':s.delivery.ratio>=0.5?'warn':'bad'}">${(100*s.delivery.ratio).toFixed(1)}%</td>
+   <td>${s.goodput_bps?(s.goodput_bps/1000).toFixed(1)+" kbps":"—"}</td>
+   <td>${s.phy_rate_bps?(s.phy_rate_bps/1e6).toFixed(1)+" Mbps":"—"}</td></tr>`).join("")
+  ||`<tr><td colspan=8 class="warn">no sessions recorded</td></tr>`;
+ const drops=lt.responder.drops?Object.entries(lt.responder.drops).map(([k,v])=>`${k}=${v}`).join(" · "):"—";
  const jrows=Object.entries(jl.stations).map(([m,s])=>
   `<tr><td><a href="#" onclick="joinDetail('${m}');return false">${esc(m)}</a></td>
    <td>${s.attempts||0}</td><td>${esc(s.last_stage||"—")}</td>
@@ -1245,6 +1345,13 @@ async function debug(){const ev=await j("/api/halow/events"),tp=await j("/api/ha
  sae_confirm_failed = wrong PSK · dhcp_no_reach = the "associated but answers no ARP"
  trap, auto-detected. Per-MAC bundle: first-sight evidence snapshot.</p>
  <pre id="jl-out" style="max-height:400px"></pre></div>
+ <div class="card"><h2>UDP link test (receiver-counted)</h2>
+ <table><tr><th>when</th><th>source</th><th>iface</th><th>size</th><th>rcvd/decl</th><th>delivery</th><th>goodput</th><th>PHY</th></tr>${ltrows}</table>
+ <p style="color:var(--dim)">drops: ${drops} · sessions ${lt.responder.active_sessions??0} active</p>
+ <p><button class="act" onclick="ltSelf(this)">loopback self-test</button>
+ <span style="color:var(--dim)">— sink :5202 / echo :5203, wire format v1: docs/udp-linktest-protocol.md.
+ A record without iface=halow0 is a bench number, not a HaLow result.</span></p>
+ <pre id="lt-out"></pre></div>
  <div class="card"><h2>throughput test (iperf3)</h2>
  <p>target IP <input id="t-ip" placeholder="10.117.0.50">
  seconds <input id="t-sec" value="5" style="width:50px">
@@ -1268,6 +1375,10 @@ async function logsLoad(){const u=$("#l-unit").value;
  $("#l-out").textContent=d.lines.join("\n")||"(empty)"}
 async function joinDetail(m){const d=await j("/api/halow/join-log/"+m);
  $("#jl-out").textContent=JSON.stringify(d,null,1)}
+async function ltSelf(btn){btn.disabled=true;btn.textContent="running…";
+ try{const r=await(await fetch("/api/halow/linktest/selftest",{method:"POST"})).json();
+ $("#lt-out").textContent=JSON.stringify(r,null,1)}
+ finally{btn.disabled=false;btn.textContent="loopback self-test";setTimeout(render,800)}}
 async function config(){const c=await j("/api/config");
  const fwds=c.forwards.length?c.forwards.map(f=>
   `<tr><td>${esc(f.proto)}</td><td>${f.ext}</td><td>${esc(f.dest)}</td>

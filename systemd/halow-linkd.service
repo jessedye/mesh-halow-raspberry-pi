@@ -1,0 +1,14 @@
+[Unit]
+Description=HaLow UDP link tester (receiver-counted sink/echo, ports 5202/5203)
+After=network.target
+
+[Service]
+Type=simple
+User=halow-ui
+ExecStart=/usr/local/bin/halow-linkd serve
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

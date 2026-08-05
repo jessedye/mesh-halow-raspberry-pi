@@ -169,7 +169,17 @@ nothing on the v1 rejected list); verifier corrections are folded in.
     Sleep-aware freshness at 3x the node's own expected interval
     (nodewatch rule) — interval source: /api/nodes proxy or a reservation
     field. [small/high]
-19. **ESP32-class link tester** — sequenced-UDP sink/echo on 10.117.0.1
+19. **ESP32-class link tester** — MACHINERY DONE 2026-08-05 (halow-linkd
+    sink :5202 / echo :5203, wire format v1 FROZEN in
+    docs/udp-linktest-protocol.md; receiver-counting proven on-device:
+    declared 1000, transmitted ~950, gateway counted 945 arrivals with
+    completed=false [M loopback]; capacity/echo-rate/size/total bounds
+    all exercised; LAN ingress datagrams dropped+counted 50/50 with zero
+    record (the per-packet check IS the firewall); measure.py Delivery
+    vocabulary validates and counted_at=sender is refused; zero sudoers
+    entries. Real [M] HaLow numbers await the first station — reject any
+    [M] claim citing a record without iface=halow0.) — sequenced-UDP
+    sink/echo on 10.117.0.1
     with RECEIVER-side counting (mesh-v4 discipline: a sender once
     reported acked=1000/failed=0 while 424/1000 arrived), measure.py-
     shaped JSONL records + history endpoint. A full iperf3 client inside

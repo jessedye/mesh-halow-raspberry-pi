@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""halow-linkd — sequenced-UDP link tester with receiver-side counting
+(roadmap 19). The ESP32-class harness for milestone (f): a full iperf3
+client inside Meshtastic on a 1 MHz-SPI-bound node is unrealistic, and
+TCP retransmission masks the loss being measured.
+
+Ports (wire format v1, frozen — docs/udp-linktest-protocol.md):
+  5202/udp  sink  count sequenced datagrams AT THE RECEIVER, one jsonl
+                  record per session (delivery.counted_at="receiver" —
+                  a sender once reported acked=1000/failed=0 while
+                  424/1000 arrived; mesh-v4 measure.py refuses anything
+                  not receiver-counted)
+  5203/udp  echo  return exactly the datagram that arrived, rate-bounded
+
+No control surface: no datagram starts, stops, or configures anything;
+invalid datagrams are dropped silently and counted. Ingress is enforced
+per-packet (halow0->10.117.0.1 or lo only) because nftables has no input
+chain — this check is the ONLY filter and it is load-bearing.
+
+Runs unprivileged as halow-ui. Zero sudoers entries.
+
+  halow-linkd serve            the daemon (systemd)
+  halow-linkd send ...         reference client — the executable spec for
+                               the ESP32 client; sender stats are [C]
+  halow-linkd selftest         bounded loopback verification, exit != 0 on fail
+"""
+
+import json
+import os
+import random
+import select
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+MAGIC = b"HLT1"
+HDR = struct.Struct("<4sIIII")  # magic, session_id, seq, total, sender_ms
+HDR_LEN = 20
+SINK_PORT, ECHO_PORT = 5202, 5203
+MIN_DGRAM, MAX_DGRAM = 20, 1400   # 1400 stays clear of IP fragmentation
+MAX_TOTAL = 5000                  # mirrors the 5000-frame capture cap
+IDLE_S, MAX_AGE_S = 10, 120       # hard-pacing senders; state is a bitmap
+MAX_SESSIONS, MAX_PER_SRC = 8, 2
+ECHO_RATE, ECHO_BURST = 600, 200  # per source; bounds abuse, not measurement
+RING = 2000
+GOODPUT_MIN_N, GOODPUT_MIN_ELAPSED = 50, 0.5  # small-n rate is the trap
+STATE_DIR = "/var/lib/halow"
+RECORDS = os.path.join(STATE_DIR, "linktest.jsonl")
+STATE = os.path.join(STATE_DIR, "linktest-state.json")
+GW_IP = "10.117.0.1"
+IFACE = "halow0"
+
+
+def atomic_write(path, data, mode=0o644):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def ifindex(name):
+    try:
+        return socket.if_nametoindex(name)
+    except OSError:
+        return None
+
+
+def parse_pktinfo(ancdata):
+    """(ifindex, dst_ip) from IP_PKTINFO, or (None, None)."""
+    for level, ctype, data in ancdata:
+        if level == socket.IPPROTO_IP and ctype == socket.IP_PKTINFO:
+            idx, _spec, addr = struct.unpack("i4s4s", data[:12])
+            return idx, socket.inet_ntoa(addr)
+    return None, None
+
+
+# ---------- responder ----------
+
+class Session:
+    __slots__ = ("src", "sid", "total", "size", "bitmap", "unique", "dups",
+                 "reordered", "max_seq", "first_t", "last_t", "payload",
+                 "iface")
+
+    def __init__(self, src, sid, total, size, iface, now):
+        self.src, self.sid, self.total = src, sid, total
+        self.size, self.iface = size, iface
+        self.bitmap = bytearray((total + 7) // 8)
+        self.unique = self.dups = self.reordered = 0
+        self.max_seq = -1
+        self.first_t = self.last_t = now
+        self.payload = 0
+
+
+def neigh_mac(ip):
+    try:
+        raw = subprocess.run(["ip", "-j", "neigh"], capture_output=True,
+                             text=True, timeout=5).stdout
+        for n in json.loads(raw or "[]"):
+            if n.get("dst") == ip and n.get("lladdr"):
+                return n["lladdr"].lower()
+    except Exception:
+        pass
+    return None
+
+
+def phy_rate(mac):
+    """rx bitrate for the source MAC: live iw first, stations.jsonl (<=60s)
+    fallback. (source_name, bps) or (None, None). Never invented."""
+    if not mac:
+        return None, None
+    try:
+        out = subprocess.run(["iw", "dev", IFACE, "station", "get", mac],
+                             capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if "rx bitrate" in line:
+                return "iw", float(line.split(":", 1)[1].split()[0]) * 1e6
+    except Exception:
+        pass
+    try:
+        best = None
+        with open(os.path.join(STATE_DIR, "stations.jsonl")) as f:
+            for line in f:
+                try:
+                    s = json.loads(line)
+                    if s.get("mac") == mac and "rx_mbps" in s:
+                        best = s
+                except Exception:
+                    pass
+        if best and time.time() - best["t"] <= 60:
+            return "stations.jsonl", best["rx_mbps"] * 1e6
+    except OSError:
+        pass
+    return None, None
+
+
+def link_mtu():
+    try:
+        raw = subprocess.run(["ip", "-j", "link", "show", IFACE],
+                             capture_output=True, text=True, timeout=5).stdout
+        return json.loads(raw or "[]")[0].get("mtu")
+    except Exception:
+        return None
+
+
+def serve():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    socks = {}
+    for port in (SINK_PORT, ECHO_PORT):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_PKTINFO, 1)
+        s.bind(("0.0.0.0", port))
+        s.setblocking(False)
+        socks[s.fileno()] = (s, port)
+    sessions = {}
+    buckets = {}   # echo token buckets: src -> [tokens, last]
+    drops = {k: 0 for k in ("bad_magic", "too_big", "bad_total",
+                            "wrong_iface", "capacity", "echo_rate")}
+    started = int(time.time())
+    lo_idx = ifindex("lo")
+    last_sweep = last_state = 0.0
+
+    def ingress_ok(idx, dst):
+        if idx == lo_idx:
+            return "lo"
+        if idx is not None and idx == ifindex(IFACE) and dst == GW_IP:
+            return IFACE
+        return None
+
+    def flush_state():
+        atomic_write(STATE, json.dumps({
+            "since": started, "active_sessions": len(sessions),
+            "drops": drops}))
+
+    def finalize(key, sess, completed):
+        mac = neigh_mac(sess.src) if sess.iface != "lo" else None
+        src_name, rate = (phy_rate(mac) if sess.iface != "lo"
+                          else (None, None))
+        elapsed = round(sess.last_t - sess.first_t, 3)
+        goodput = None
+        if sess.unique >= GOODPUT_MIN_N and elapsed >= GOODPUT_MIN_ELAPSED:
+            goodput = round(sess.payload * 8 / elapsed, 1)
+        rec = {"v": 1, "kind": "udp-sink", "t": int(time.time()),
+               "src_ip": sess.src, "src_mac": mac, "iface": sess.iface,
+               "session_id": sess.sid, "size_bytes": sess.size,
+               "received_unique": sess.unique, "duplicates": sess.dups,
+               "reordered": sess.reordered, "completed": completed,
+               "elapsed_s": elapsed, "mtu": link_mtu(),
+               "goodput_bps": goodput,
+               "phy_rate_bps": rate, "phy_rate_source": src_name,
+               "delivery": {"sent": sess.total, "received": sess.unique,
+                            "counted_at": "receiver",
+                            "ratio": round(sess.unique / sess.total, 4),
+                            "retries": 0, "duplicates": sess.dups}}
+        with open(RECORDS, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        try:
+            lines = open(RECORDS).readlines()
+            if len(lines) > RING + 200:
+                atomic_write(RECORDS, "".join(lines[-RING:]))
+        except OSError:
+            pass
+        os.chmod(RECORDS, 0o644)
+        del sessions[key]
+        flush_state()
+
+    flush_state()
+    while True:
+        ready, _, _ = select.select([s for s, _ in socks.values()], [], [], 1.0)
+        now = time.monotonic()
+        wall = time.time()
+        for s in ready:
+            port = socks[s.fileno()][1]
+            while True:
+                try:
+                    data, ancdata, _flags, addr = s.recvmsg(2048, 256)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    break
+                idx, dst = parse_pktinfo(ancdata)
+                iface = ingress_ok(idx, dst)
+                if iface is None:
+                    drops["wrong_iface"] += 1
+                    continue
+                if len(data) < HDR_LEN or data[:4] != MAGIC:
+                    drops["bad_magic"] += 1
+                    continue
+                if len(data) > MAX_DGRAM:
+                    drops["too_big"] += 1
+                    continue
+                _m, sid, seq, total, _ms = HDR.unpack_from(data)
+                if not (1 <= total <= MAX_TOTAL) or sid == 0 or seq >= total:
+                    drops["bad_total"] += 1
+                    continue
+                src = addr[0]
+                if port == ECHO_PORT:
+                    b = buckets.setdefault(src, [ECHO_BURST, now])
+                    b[0] = min(ECHO_BURST, b[0] + (now - b[1]) * ECHO_RATE)
+                    b[1] = now
+                    if b[0] < 1:
+                        drops["echo_rate"] += 1
+                        continue
+                    b[0] -= 1
+                    try:
+                        s.sendto(data, addr)   # byte-identical, no amplification
+                    except OSError:
+                        pass
+                    continue
+                key = (src, sid)
+                sess = sessions.get(key)
+                if sess is None:
+                    if (len(sessions) >= MAX_SESSIONS or
+                            sum(1 for k in sessions if k[0] == src)
+                            >= MAX_PER_SRC):
+                        drops["capacity"] += 1
+                        continue
+                    sess = sessions[key] = Session(src, sid, total,
+                                                   len(data), iface, wall)
+                sess.last_t = wall
+                byte, bit = divmod(seq, 8)
+                if sess.bitmap[byte] & (1 << bit):
+                    sess.dups += 1
+                else:
+                    sess.bitmap[byte] |= 1 << bit
+                    sess.unique += 1
+                    sess.payload += len(data) - HDR_LEN
+                    if seq < sess.max_seq:
+                        sess.reordered += 1
+                    sess.max_seq = max(sess.max_seq, seq)
+                if sess.unique >= sess.total:
+                    finalize(key, sess, True)
+        if now - last_sweep >= 1.0:
+            last_sweep = now
+            for key, sess in list(sessions.items()):
+                if (wall - sess.last_t > IDLE_S
+                        or wall - sess.first_t > MAX_AGE_S):
+                    finalize(key, sess, False)
+        if now - last_state >= 10.0:
+            last_state = now
+            flush_state()
+
+
+# ---------- reference client (the ESP32 client's executable spec) ----------
+
+def send_main(argv):
+    opt = {"target": "127.0.0.1", "port": None, "count": 500, "size": 200,
+           "pps": 400, "session-id": None, "mode": "sink", "drop": 0.0}
+    i = 0
+    while i < len(argv):
+        k = argv[i].lstrip("-")
+        if k not in opt:
+            print(f"unknown option --{k}")
+            return 2
+        opt[k] = argv[i + 1]
+        i += 2
+    count = max(1, min(int(opt["count"]), MAX_TOTAL))
+    size = max(MIN_DGRAM, min(int(opt["size"]), MAX_DGRAM))
+    pps = max(1, min(int(opt["pps"]), 5000))
+    mode = opt["mode"]
+    port = int(opt["port"]) if opt["port"] else (
+        ECHO_PORT if mode == "echo" else SINK_PORT)
+    sid = int(opt["session-id"]) if opt["session-id"] else \
+        random.randrange(1, 2**32)
+    dropf = float(opt["drop"])
+    pad = b"\x00" * (size - HDR_LEN)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2.0)
+    interval = 1.0 / pps
+    sent = 0
+    rtts = []
+    echo_ok = echo_bad = 0
+    t0 = time.monotonic()
+    for seq in range(count):
+        if dropf and random.random() < dropf:
+            continue   # deliberately skipped: proves receiver-side counting
+        ms = int(time.monotonic() * 1000) & 0xFFFFFFFF
+        pkt = HDR.pack(MAGIC, sid, seq, count, ms) + pad
+        s.sendto(pkt, (opt["target"], port))
+        sent += 1
+        if mode == "echo":
+            try:
+                reply, _ = s.recvfrom(2048)
+                r_ms = HDR.unpack_from(reply)[4]
+                rtts.append(((int(time.monotonic() * 1000) & 0xFFFFFFFF)
+                             - r_ms) & 0xFFFFFFFF)
+                echo_ok += 1 if reply == pkt else 0
+                echo_bad += 0 if reply == pkt else 1
+            except socket.timeout:
+                pass
+        t_next = t0 + (seq + 1) * interval
+        d = t_next - time.monotonic()
+        if d > 0:
+            time.sleep(d)
+    out = {"session_id": sid, "declared_total": count, "transmitted": sent,
+           "size": size, "pps": pps, "mode": mode}
+    if mode == "echo":
+        # echo stats ARE receiver-counted — this end received the replies
+        out["echo"] = {"replies": len(rtts), "byte_identical": echo_ok,
+                       "mismatched": echo_bad,
+                       "rtt_ms": {"min": min(rtts), "avg":
+                                  round(sum(rtts) / len(rtts), 1),
+                                  "max": max(rtts)} if rtts else None,
+                       "counted_at": "receiver"}
+    else:
+        out["note"] = ("[C] sender-side — not a result; confirm at the "
+                       "receiver (GET /api/halow/linktest)")
+    print(json.dumps(out, indent=1))
+    return 0
+
+
+# ---------- selftest ----------
+
+def wait_record(sid, timeout):
+    dl = time.monotonic() + timeout
+    while time.monotonic() < dl:
+        try:
+            for line in open(RECORDS):
+                try:
+                    r = json.loads(line)
+                    if r.get("session_id") == sid:
+                        return r
+                except Exception:
+                    pass
+        except OSError:
+            pass
+        time.sleep(0.5)
+    return None
+
+
+def selftest():
+    ok = True
+
+    def check(name, cond, detail=""):
+        nonlocal ok
+        print(f"{'PASS' if cond else 'FAIL'} {name}{' ' + detail if detail else ''}")
+        ok = ok and cond
+
+    st0 = json.load(open(STATE))
+    # 1. complete loopback sink run
+    sid = random.randrange(1, 2**32)
+    send_main(["--target", "127.0.0.1", "--count", "500", "--size", "200",
+               "--pps", "400", "--session-id", str(sid)])
+    rec = wait_record(sid, 15)
+    check("sink-record", rec is not None)
+    if rec:
+        check("sink-complete", rec["completed"] is True and
+              rec["received_unique"] == 500 and rec["duplicates"] == 0)
+        check("sink-receiver-counted",
+              rec["delivery"]["counted_at"] == "receiver")
+        check("sink-iface-lo", rec["iface"] == "lo"
+              and rec["phy_rate_bps"] is None)
+        check("sink-goodput-sane", rec["goodput_bps"] is not None
+              and 100_000 < rec["goodput_bps"] < 2_000_000,
+              f"({rec['goodput_bps']} bps at 400pps x 180B payload)")
+    # 2. echo run
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "send",
+                        "--target", "127.0.0.1", "--mode", "echo",
+                        "--count", "100", "--size", "200", "--pps", "200"],
+                       capture_output=True, text=True, timeout=30)
+    try:
+        e = json.loads(r.stdout)["echo"]
+        check("echo-replies", e["replies"] == 100 and
+              e["byte_identical"] == 100 and e["mismatched"] == 0)
+    except Exception:
+        check("echo-replies", False, r.stdout[-100:])
+    # 3. bounds probes -> counters move, no reply
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(1.0)
+    s.sendto(b"garbage-not-a-header-x", ("127.0.0.1", ECHO_PORT))
+    try:
+        s.recvfrom(2048)
+        check("garbage-no-reply", False)
+    except socket.timeout:
+        check("garbage-no-reply", True)
+    s.sendto(HDR.pack(MAGIC, 1, 0, 6000, 0), ("127.0.0.1", SINK_PORT))
+    s.sendto(HDR.pack(MAGIC, 2, 0, 100, 0) + b"\x00" * 1600,
+             ("127.0.0.1", SINK_PORT))
+    time.sleep(11)   # state flush cadence
+    st1 = json.load(open(STATE))
+    check("counter-bad-magic",
+          st1["drops"]["bad_magic"] > st0["drops"]["bad_magic"])
+    check("counter-bad-total",
+          st1["drops"]["bad_total"] > st0["drops"]["bad_total"])
+    check("counter-too-big",
+          st1["drops"]["too_big"] > st0["drops"]["too_big"])
+    return 0 if ok else 1
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
+    if cmd == "serve":
+        return serve()
+    if cmd == "send":
+        return send_main(sys.argv[2:])
+    if cmd == "selftest":
+        return selftest()
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
