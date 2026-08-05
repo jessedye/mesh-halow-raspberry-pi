@@ -1,0 +1,18 @@
+[Unit]
+Description=HaLow S1G station (wpa_supplicant_s1g on MM6108)
+After=network.target halow-net.service sys-subsystem-net-devices-halow0.device
+Wants=halow-net.service
+Conflicts=halow-ap.service
+BindsTo=sys-subsystem-net-devices-halow0.device
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/halowctl gen
+ExecStart=/usr/local/bin/wpa_supplicant_s1g -i halow0 -c /etc/halow/wpa_supplicant_s1g.conf
+# Address comes from the remote AP once associated
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 30); do wpa_cli_s1g -p /var/run/wpa_supplicant_s1g -i halow0 status 2>/dev/null | grep -q wpa_state=COMPLETED && exec dhclient -v halow0; sleep 2; done; true'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=sys-subsystem-net-devices-halow0.device
