@@ -653,6 +653,53 @@ def api_diag_chip():
     return jsonify({"ok": ok, "output": out})
 
 
+@app.get("/api/halow/link")
+@app.get("/api/halow/link/<mac>")
+@authed
+def api_halow_link(mac=None):
+    """Per-station link telemetry — rate and delivery from measurement,
+    shaped for deriving a TRANSPORT_HALOW rung cost."""
+    samples = []
+    try:
+        with open("/var/lib/halow/stations.jsonl") as f:
+            for line in f:
+                try:
+                    s = json.loads(line)
+                    if mac is None or s["mac"].lower() == mac.lower():
+                        samples.append(s)
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    samples = samples[-720:]
+    by_mac = {}
+    for s in samples:
+        by_mac.setdefault(s["mac"], []).append(s)
+    out = {}
+    for m, ss in by_mac.items():
+        last = ss[-1]
+        tx_pkts = last.get("tx_packets", 0)
+        retries = last.get("tx_retries", 0)
+        failed = last.get("tx_failed", 0)
+        rates = [x["tx_mbps"] for x in ss if "tx_mbps" in x]
+        sigs = [x["signal_dbm"] for x in ss if "signal_dbm" in x]
+        out[m] = {
+            "now": last,
+            "n_samples": len(ss),
+            "tx_mbps": {"min": min(rates), "avg": round(sum(rates)/len(rates), 2),
+                        "max": max(rates)} if rates else None,
+            "signal_dbm": {"min": min(sigs), "avg": round(sum(sigs)/len(sigs), 1),
+                           "max": max(sigs)} if sigs else None,
+            "delivery_pct": round(100 * (tx_pkts - failed) / tx_pkts, 2)
+            if tx_pkts else None,
+            "retry_pct": round(100 * retries / tx_pkts, 2) if tx_pkts else None,
+        }
+    if mac is not None:
+        return jsonify(out.get(mac.lower(), out.get(mac.upper(),
+                       {"error": f"no samples for {mac}", "stations": list(out)})))
+    return jsonify({"stations": out})
+
+
 @app.get("/api/metrics")
 @authed
 def api_metrics():

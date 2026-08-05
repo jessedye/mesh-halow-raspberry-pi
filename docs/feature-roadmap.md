@@ -25,7 +25,7 @@ UI/API, recovery — but the clients set a higher bar in three areas:
    (`results/halow-throughput-*.json`, mesh-v4 `baseline.py` culture:
    same harness, adequate n, report spread). The profile table then
    carries `[M]` numbers.
-2. **Transport-ladder support** — the nodes' future `TRANSPORT_HALOW`
+2. **Transport-ladder support** — DONE 2026-08-05 (halow-mon samples per-station signal/rate/retries each minute; GET /api/halow/link[/<mac>] serves min/avg/max rate, signal, delivery%% and retry%% — populates at first join). — the nodes' future `TRANSPORT_HALOW`
    rung wants a metric "derived from measured rate and delivery"
    (transport-ladder doc). Expose `GET /api/halow/link/<mac>`: current
    rate, RSSI, retry/fail counters, and a short history — shaped so a
@@ -68,9 +68,9 @@ UI/API, recovery — but the clients set a higher bar in three areas:
 11. **Packet capture helper** — bounded tcpdump on halow0 via API
     (rotating, size-capped) for association-failure debugging: "confirm
     at the receiver" needs receiver-side eyes.
-12. **NTP for the HaLow net** — chrony serving 10.117.0.0/24; nodes
+12. **NTP for the HaLow net** — DONE 2026-08-05 (chrony allow 10.117/10.42, DHCP option ntp-server 10.117.0.1; synced stratum 3). — chrony serving 10.117.0.0/24; nodes
     without GPS lock skip time-based pruning; cheap log-correlation win.
-13. **mDNS** — avahi announcing `halow-gw.local` so tools stop
+13. **mDNS** — DONE 2026-08-05 (avahi host-name halow-gw; PC resolves halow-gw.local, matches cert SAN). — avahi announcing `halow-gw.local` so tools stop
     hardcoding the IP.
 14. **Auth throttle (A4)** — failure counter with a penalty window;
     keep the mesh-v4 rule in mind (a penalty shorter than the hash cost

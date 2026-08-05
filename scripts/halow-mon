@@ -99,6 +99,39 @@ def main():
     with open(METRICS, "a") as f:
         f.write(json.dumps(sample) + "\n")
 
+    # per-station link samples — the raw material for a measured
+    # TRANSPORT_HALOW metric (rate and delivery, never datasheet numbers)
+    dump = sh("iw dev halow0 station dump")
+    if dump:
+        stations_log = os.path.join(STATE_DIR, "stations.jsonl")
+        cur = None
+        entries = []
+        for line in dump.splitlines():
+            line = line.strip()
+            if line.startswith("Station"):
+                cur = {"t": now, "mac": line.split()[1]}
+                entries.append(cur)
+            elif cur is not None and ":" in line:
+                k, v = [x.strip() for x in line.split(":", 1)]
+                if k == "signal":
+                    cur["signal_dbm"] = int(v.split()[0])
+                elif k == "tx bitrate":
+                    cur["tx_mbps"] = float(v.split()[0])
+                elif k == "rx bitrate":
+                    cur["rx_mbps"] = float(v.split()[0])
+                elif k in ("tx packets", "tx retries", "tx failed"):
+                    cur[k.replace(" ", "_")] = int(v)
+        with open(stations_log, "a") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        try:
+            lines = open(stations_log).readlines()
+            if len(lines) > RING_LINES * 4:
+                open(stations_log, "w").writelines(lines[-RING_LINES * 2:])
+        except OSError:
+            pass
+        os.chmod(stations_log, 0o644)
+
     # ring prune (cheap: only when oversized)
     try:
         lines = open(METRICS).readlines()

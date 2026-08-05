@@ -215,6 +215,7 @@ bind-dynamic
 dhcp-range=${START},${END},${LEASE}
 dhcp-option=option:router,10.117.0.1
 dhcp-option=option:dns-server,${DNS}
+dhcp-option=option:ntp-server,10.117.0.1
 dhcp-authoritative
 EOF
     sudo systemctl restart dnsmasq && echo "dhcp: ${START}-${END} lease ${LEASE} dns ${DNS}"

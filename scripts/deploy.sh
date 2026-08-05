@@ -21,7 +21,7 @@ echo "== sync repo"
 rsync -a --delete --exclude .git --exclude secrets.env "$REPO/" "$PI:mesh-halow-raspberry-pi/"
 
 echo "== packages"
-ssh "$PI" 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq python3-flask isc-dhcp-client iperf3 conntrack bind9-dnsutils >/dev/null 2>&1; true'
+ssh "$PI" 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq python3-flask isc-dhcp-client iperf3 conntrack bind9-dnsutils chrony avahi-daemon >/dev/null 2>&1; true'
 
 echo "== /etc/halow"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT; umask 077
@@ -59,6 +59,8 @@ sudo install -m640 -o root -g halow-ui /tmp/halow-deploy/ui.conf /tmp/halow-depl
 rm -rf /tmp/halow-deploy
 sudo install -m644 config/halow-profiles.json config/nftables-halow.conf /etc/halow/
 sudo install -m644 config/dnsmasq-halow.conf /etc/dnsmasq.d/halow.conf
+sudo install -m644 config/chrony-halow.conf /etc/chrony/conf.d/halow.conf
+sudo sed -i "s/^#host-name=.*/host-name=halow-gw/" /etc/avahi/avahi-daemon.conf
 sudo install -m644 config/99-halow-unmanaged.conf /etc/NetworkManager/conf.d/
 sudo install -m644 config/99-halow-net.rules /etc/udev/rules.d/
 sudo install -m755 scripts/halowctl /usr/local/bin/
