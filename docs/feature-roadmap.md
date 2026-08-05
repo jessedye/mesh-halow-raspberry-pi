@@ -13,7 +13,7 @@ UI/API, recovery — but the clients set a higher bar in three areas:
 | A1 | ~~prebuilt hexdump~~ FIXED: re-captured clean 2026-08-05 | done |
 | A2 | ~~dev server single-threaded~~ FIXED: threaded=True | done |
 | A3 | ~~no IP SAN~~ FIXED: SAN covers .202, 10.117.0.1, 10.42.0.1, halow-gw.local | done |
-| A4 | Login has a 1 s failure delay but no failure counter/lockout; nodes run a real auth throttle. | recommended |
+| A4 | ~~no auth throttle~~ FIXED: per-IP exponential lockout | done |
 | A5 | `halow-sta.service` (STA mode) has never run against a real AP — untested, and the docs should say so until it is. | document |
 | A6 | ~~no kernel/module mismatch detection~~ FIXED: verify.sh check + halowctl status warning | done |
 
@@ -54,28 +54,28 @@ UI/API, recovery — but the clients set a higher bar in three areas:
 
 ## Recommended features (parity and leverage)
 
-8. **Config snapshot/diff** — `halowctl snapshot|diff`: /etc/halow (sans
+8. **Config snapshot/diff** — DONE 2026-08-05 (halowctl diff compares deployed vs repo, env by KEY SET only so no secret is ever compared; halowctl snapshot archives root-only. Found real drift on first run). — `halowctl snapshot|diff`: /etc/halow (sans
    secrets) vs repo defaults; the bench's config-drift lesson says the
    drift is found only when someone diffs.
 9. **S1G channel scan / survey** — `iw dev halow0 scan` via UI to see
    band occupancy before pinning channels; the LoRa co-siting hazard
    lives in the same 902–928 MHz.
-10. **Fixed-MCS test knobs** — the driver already exposes
+10. **Fixed-MCS test knobs** — DONE 2026-08-05 (halowctl rate show/set/auto over the live module params; effect on this build UNVERIFIED until a station exists, and the restore path is explicit). — the driver already exposes
     `enable_fixed_rate`/`fixed_mcs`/`fixed_bw`; surface via
     `halowctl rate` for range testing, mirroring the nodes'
     modem-preset experiments. Restore the baseline explicitly after
     (the ESP-NOW rate-harness lesson: a control that drifts is the bug).
-11. **Packet capture helper** — bounded tcpdump on halow0 via API
+11. **Packet capture helper** — DONE 2026-08-05 (halowctl capture N, 3-30s and 5000-frame capped; POST /api/diag/capture, GET downloads the pcap). — bounded tcpdump on halow0 via API
     (rotating, size-capped) for association-failure debugging: "confirm
     at the receiver" needs receiver-side eyes.
 12. **NTP for the HaLow net** — DONE 2026-08-05 (chrony allow 10.117/10.42, DHCP option ntp-server 10.117.0.1; synced stratum 3). — chrony serving 10.117.0.0/24; nodes
     without GPS lock skip time-based pruning; cheap log-correlation win.
 13. **mDNS** — DONE 2026-08-05 (avahi host-name halow-gw; PC resolves halow-gw.local, matches cert SAN). — avahi announcing `halow-gw.local` so tools stop
     hardcoding the IP.
-14. **Auth throttle (A4)** — failure counter with a penalty window;
+14. **Auth throttle (A4)** — DONE 2026-08-05 (3 free tries then exponential lockout to 5 min, per source IP, success clears; verified by locking myself out). — failure counter with a penalty window;
     keep the mesh-v4 rule in mind (a penalty shorter than the hash cost
     is invisible).
-15. **DHCP reservations** — pin node MACs to fixed 10.117.0.x addresses
+15. **DHCP reservations** — DONE 2026-08-05 (halowctl dhcp-reserve + /api/config/reservations + Config tab; add/del round-trip verified). — pin node MACs to fixed 10.117.0.x addresses
     once nodes join, so the node proxy and ladder metrics have stable
     targets.
 

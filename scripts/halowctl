@@ -134,6 +134,91 @@ PY
       sudo systemctl restart halow-sta 2>/dev/null || echo "STA starts when halow0 appears"
     fi
     ;;
+  dhcp-reserve)
+    RES=/etc/dnsmasq.d/halow-reservations.conf
+    sub=${2:-list}
+    case "$sub" in
+      list) grep -oP "dhcp-host=\K.*" "$RES" 2>/dev/null || echo "(none)" ;;
+      add)
+        shift 2; MAC=""; IP=""; NAME=""
+        for kv in "$@"; do case "${kv%%=*}" in
+          mac) MAC=${kv#*=};; ip) IP=${kv#*=};; name) NAME=${kv#*=};; esac; done
+        [[ "$MAC" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] || { echo "bad mac"; exit 1; }
+        [[ "$IP" =~ ^10\.117\.0\.[0-9]+$ ]] || { echo "ip must be 10.117.0.x"; exit 1; }
+        [[ -z "$NAME" || "$NAME" =~ ^[A-Za-z0-9-]+$ ]] || { echo "bad name"; exit 1; }
+        sudo touch "$RES"
+        sudo sed -i "/dhcp-host=${MAC}/Id" "$RES"
+        echo "dhcp-host=${MAC},${IP}${NAME:+,$NAME}" | sudo tee -a "$RES" >/dev/null
+        sudo systemctl restart dnsmasq && echo "reserved ${IP} for ${MAC}"
+        ;;
+      del)
+        shift 2; MAC=${1#mac=}
+        [[ "$MAC" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] || { echo "bad mac"; exit 1; }
+        sudo sed -i "/dhcp-host=${MAC}/Id" "$RES" 2>/dev/null
+        sudo systemctl restart dnsmasq && echo "released ${MAC}"
+        ;;
+      *) echo "usage: halowctl dhcp-reserve list|add mac= ip= [name=]|del mac="; exit 1 ;;
+    esac
+    ;;
+  capture)
+    SECS=${2:-10}
+    [[ "$SECS" =~ ^[0-9]+$ ]] && [ "$SECS" -ge 3 ] && [ "$SECS" -le 30 ] || { echo "seconds 3-30"; exit 1; }
+    OUT=/var/lib/halow/capture.pcap
+    sudo timeout "$SECS" tcpdump -i "${HALOW_IF:-halow0}" -c 5000 -w "$OUT" 2>&1 | tail -2
+    sudo chmod 644 "$OUT" 2>/dev/null
+    ls -la "$OUT" 2>/dev/null || echo "no capture produced"
+    ;;
+  rate)
+    P=/sys/module/morse/parameters
+    case "${2:-show}" in
+      show)
+        echo "enable_fixed_rate=$(cat $P/enable_fixed_rate) fixed_mcs=$(cat $P/fixed_mcs) fixed_bw=$(cat $P/fixed_bw)"
+        echo "NOTE: experimental test knobs; runtime effect unverified — restart halow-ap after changing, and always 'rate auto' + restart to restore (a control that drifts is the bug)"
+        ;;
+      auto) echo 0 | sudo tee $P/enable_fixed_rate >/dev/null && echo "fixed rate off" ;;
+      set)
+        shift 2
+        for kv in "$@"; do
+          k=${kv%%=*}; v=${kv#*=}
+          [[ "$v" =~ ^[0-9]+$ ]] || { echo "numeric values only"; exit 1; }
+          case "$k" in
+            mcs) echo "$v" | sudo tee $P/fixed_mcs >/dev/null ;;
+            bw)  echo "$v" | sudo tee $P/fixed_bw >/dev/null ;;
+            *) echo "unknown key $k (mcs|bw)"; exit 1 ;;
+          esac
+        done
+        echo 1 | sudo tee $P/enable_fixed_rate >/dev/null
+        echo "fixed rate on: $(cat $P/fixed_mcs) mcs, bw code $(cat $P/fixed_bw) — restart halow-ap to apply"
+        ;;
+      *) echo "usage: halowctl rate show|set mcs=N bw=N|auto"; exit 1 ;;
+    esac
+    ;;
+  diff)
+    REPO=${2:-/home/pi/mesh-halow-raspberry-pi}
+    rc=0
+    for pair in "config/halow-profiles.json:/etc/halow/halow-profiles.json" \
+                "config/nftables-halow.conf:/etc/halow/nftables-halow.conf" \
+                "config/morse.conf:/etc/modprobe.d/morse.conf"; do
+      r="$REPO/${pair%%:*}"; l="${pair#*:}"
+      if ! diff -q "$r" "$l" >/dev/null 2>&1; then
+        echo "DRIFT: $l vs $r"; diff -u "$r" "$l" 2>&1 | head -15; rc=1
+      fi
+    done
+    # env: compare key sets only, never values (the passphrase lives there)
+    comm -3 <(grep -oP "^[A-Z_]+(?==)" "$REPO/config/halow.env.example" | sort) \
+            <(sudo grep -oP "^[A-Z_]+(?==)" /etc/halow/halow.env | sort) | \
+      sed "s/^\t/extra key on device: /; s/^[^ \t]/missing key on device: &/" | grep . && rc=1
+    [ $rc -eq 0 ] && echo "no drift"
+    exit $rc
+    ;;
+  snapshot)
+    D=/var/lib/halow/config-snapshot-$(date +%Y%m%d-%H%M%S)
+    sudo mkdir -p "$D"
+    sudo cp /etc/halow/halow.env /etc/halow/halow-profiles.json /etc/halow/nftables-halow.conf \
+            /etc/halow/forwards.json /etc/modprobe.d/morse.conf /etc/dnsmasq.d/halow*.conf "$D/" 2>/dev/null
+    sudo chmod 700 "$D"
+    echo "snapshot: $D (root-only; includes secrets — never copy into the repo)"
+    ;;
   chip)
     morse_cli -i "${HALOW_IF:-halow0}" version 2>&1
     morse_cli -i "${HALOW_IF:-halow0}" stats 2>&1 | head -40

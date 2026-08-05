@@ -91,21 +91,50 @@ def verify_creds(user_pass):
     return hmac.compare_digest(calc, digest)
 
 
+# Auth failure throttle (mesh-v4 model: free tries, growing penalty,
+# success clears; penalty must exceed the hash cost or it is invisible).
+_FAILS = {}  # ip -> [count, penalty_until]
+
+
+def _throttled(ip):
+    f = _FAILS.get(ip)
+    return bool(f and f[1] > time.time())
+
+
+def _auth_fail(ip):
+    f = _FAILS.get(ip, [0, 0.0])
+    f[0] += 1
+    if f[0] > 3:
+        f[1] = time.time() + min(30 * (2 ** (f[0] - 4)), 300)
+    _FAILS[ip] = f
+
+
+def _auth_ok(ip):
+    _FAILS.pop(ip, None)
+
+
 def check_auth(header):
     """Basic auth and Bearer tokens stay valid for curl/scripts alongside
     browser sessions. The Bearer token is the mesh-v4 ADMIN_TOKEN; only its
     sha256 is stored (ui.conf API_TOKEN_HASH), mirroring the nodes' model."""
+    ip = request.remote_addr
+    if _throttled(ip):
+        return False
     if header.startswith("Bearer "):
         want = load_kv(UI_CONF).get("API_TOKEN_HASH", "")
         got = hashlib.sha256(header[7:].strip().encode()).hexdigest()
-        return bool(want) and hmac.compare_digest(got, want)
+        ok = bool(want) and hmac.compare_digest(got, want)
+        _auth_ok(ip) if ok else _auth_fail(ip)
+        return ok
     if not header.startswith("Basic "):
         return False
     try:
         user_pass = base64.b64decode(header[6:]).decode()
     except Exception:
         return False
-    return verify_creds(user_pass)
+    ok = verify_creds(user_pass)
+    _auth_ok(ip) if ok else _auth_fail(ip)
+    return ok
 
 
 def authed(fn):
@@ -127,15 +156,21 @@ def login():
         return redirect("/")
     error = ""
     if request.method == "POST":
-        user = request.form.get("username", "")
-        pw = request.form.get("password", "")
-        if verify_creds(f"{user}:{pw}"):
-            session.permanent = True
-            session["authed"] = True
-            session["user"] = user
-            return redirect("/")
-        time.sleep(1)  # slow brute force; PBKDF2 already costs ~0.1s
-        error = "wrong username or password"
+        ip = request.remote_addr
+        if _throttled(ip):
+            error = "too many failures — wait before retrying (retrying extends nothing here, but stop anyway)"
+        else:
+            user = request.form.get("username", "")
+            pw = request.form.get("password", "")
+            if verify_creds(f"{user}:{pw}"):
+                _auth_ok(ip)
+                session.permanent = True
+                session["authed"] = True
+                session["user"] = user
+                return redirect("/")
+            _auth_fail(ip)
+            time.sleep(1)  # slow brute force; PBKDF2 already costs ~0.1s
+            error = "wrong username or password"
     return Response(LOGIN_PAGE.replace("__ERROR__",
                     f'<p class="err">{error}</p>' if error else ""),
                     mimetype="text/html")
@@ -295,6 +330,16 @@ def api_config():
         forwards = json.load(open("/etc/halow/forwards.json"))
     except Exception:
         pass
+    reservations = []
+    try:
+        for line in open("/etc/dnsmasq.d/halow-reservations.conf"):
+            if line.startswith("dhcp-host="):
+                parts = line.strip()[10:].split(",")
+                reservations.append({"mac": parts[0],
+                                     "ip": parts[1] if len(parts) > 1 else "",
+                                     "name": parts[2] if len(parts) > 2 else ""})
+    except OSError:
+        pass
     wifi = {}
     for line in sh("nmcli -t -f 802-11-wireless.ssid,802-11-wireless.channel con show mesh-2g").splitlines():
         if ":" in line:
@@ -321,6 +366,7 @@ def api_config():
             "dns": dns.group(1) if dns else "",
         },
         "forwards": forwards,
+        "reservations": reservations,
     })
 
 
@@ -410,6 +456,46 @@ def api_config_forwards():
     ok, o = halowctl(args)
     return (jsonify({"ok": True, "output": o}) if ok
             else (jsonify({"error": o}), 500))
+
+
+@app.post("/api/config/reservations")
+@authed
+def api_config_reservations():
+    op = request.form.get("op", "add")
+    if op == "add":
+        args = ["dhcp-reserve", "add",
+                f"mac={request.form.get('mac', '')}",
+                f"ip={request.form.get('ip', '')}"]
+        if request.form.get("name"):
+            args.append(f"name={request.form.get('name')}")
+    elif op == "del":
+        args = ["dhcp-reserve", "del", f"mac={request.form.get('mac', '')}"]
+    else:
+        return jsonify({"error": "op must be add or del"}), 400
+    ok, o = halowctl(args)
+    return (jsonify({"ok": True, "output": o}) if ok
+            else (jsonify({"error": o}), 500))
+
+
+@app.post("/api/diag/capture")
+@authed
+def api_diag_capture():
+    secs = request.form.get("seconds", "10")
+    ok, o = halowctl(["capture", secs], timeout=45)
+    return (jsonify({"ok": True, "output": o, "download": "/api/diag/capture"})
+            if ok else (jsonify({"error": o}), 500))
+
+
+@app.get("/api/diag/capture")
+@authed
+def api_diag_capture_get():
+    try:
+        data = open("/var/lib/halow/capture.pcap", "rb").read()
+    except OSError:
+        return jsonify({"error": "no capture yet"}), 404
+    return Response(data, mimetype="application/vnd.tcpdump.pcap",
+                    headers={"Content-Disposition":
+                             "attachment; filename=halow0.pcap"})
 
 
 @app.post("/api/system/reboot")
@@ -965,11 +1051,20 @@ async function diag(){const nb=await j("/api/diag/neigh"),sv=await j("/api/diag/
  <div class="card"><h2>channel survey</h2>
  <p>utilization: ${sv.utilization_pct!=null?sv.utilization_pct+"%":"n/a"}</p>
  <pre>${esc(sv.surveys.map(s=>JSON.stringify(s)).join("\n").slice(0,1500))}</pre></div>
+ <div class="card"><h2>packet capture (halow0)</h2>
+ <p>seconds <input id="cap-s" value="10" style="width:50px">
+ <button class="act" onclick="capRun(this)">capture</button>
+ <a class="act" style="text-decoration:none;padding:6px 12px" href="/api/diag/capture">download last .pcap</a></p>
+ <pre id="cap-out"></pre></div>
  <div class="card"><h2>more</h2>
  <p><button class="act" onclick="dLoad('/api/diag/flows','flows',d=>d.flows.join("\n")||"(none)")">NAT flows</button>
  <button class="act" onclick="dLoad('/api/diag/chip','chip',d=>d.output)">chip counters</button>
  <a class="act" style="text-decoration:none;padding:6px 12px" href="/api/diag" target="_blank">full diag bundle (JSON)</a></p>
  <pre id="m-out"></pre></div>`}
+async function capRun(b){b.disabled=true;b.textContent="capturing…";
+ try{const fd=new FormData();fd.append("seconds",$("#cap-s").value);
+ const d=await(await fetch("/api/diag/capture",{method:"POST",body:fd})).json();
+ $("#cap-out").textContent=d.error||d.output}finally{b.disabled=false;b.textContent="capture"}}
 async function dPing(b){b.disabled=true;try{const fd=new FormData();
  fd.append("target",$("#p-t").value);fd.append("count",$("#p-n").value);
  const d=await(await fetch("/api/diag/ping",{method:"POST",body:fd})).json();
@@ -1031,6 +1126,14 @@ async function config(){const c=await j("/api/config");
  lease <input id="d-lease" value="${esc(c.dhcp.lease)}" style="width:70px">
  DNS <input id="d-dns" value="${esc(c.dhcp.dns)}">
  <button class="act" onclick="cfgDhcp()">apply</button></p></div>
+ <div class="card"><h2>DHCP reservations (pin node MACs to fixed addresses)</h2>
+ <table><tr><th>mac</th><th>ip</th><th>name</th><th></th></tr>
+ ${c.reservations.length?c.reservations.map(r=>
+  `<tr><td>${esc(r.mac)}</td><td>${esc(r.ip)}</td><td>${esc(r.name)}</td>
+   <td><button class="act" onclick="resDel('${esc(r.mac)}')">delete</button></td></tr>`).join("")
+  :`<tr><td colspan=4 class="warn">none</td></tr>`}</table>
+ <p>mac <input id="r-mac" placeholder="aa:bb:cc:dd:ee:ff"> ip <input id="r-ip" placeholder="10.117.0.50">
+ name <input id="r-name" placeholder="node1"> <button class="act" onclick="resAdd()">reserve</button></p></div>
  <div class="card"><h2>Port forwards (LAN → HaLow net)</h2>
  <table><tr><th>proto</th><th>ext port</th><th>destination</th><th></th></tr>${fwds}</table>
  <p><select id="f-proto"><option>tcp</option><option>udp</option></select>
@@ -1061,6 +1164,9 @@ async function cfgDhcp(){await post("/api/config/dhcp",
 async function fwdAdd(){await post("/api/config/forwards",
  {op:"add",proto:$("#f-proto").value,ext:$("#f-ext").value,dest:$("#f-dest").value})}
 async function fwdDel(p,e){await post("/api/config/forwards",{op:"del",proto:p,ext:e})}
+async function resAdd(){await post("/api/config/reservations",
+ {op:"add",mac:$("#r-mac").value,ip:$("#r-ip").value,name:$("#r-name").value})}
+async function resDel(m){await post("/api/config/reservations",{op:"del",mac:m})}
 async function reboot(){if(confirm("Reboot the gateway now?"))
  await post("/api/system/reboot",{confirm:1})}
 async function ovw(){const s=await j("/api/system"),h=await j("/api/halow");
