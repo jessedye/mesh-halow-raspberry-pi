@@ -1,0 +1,7 @@
+{
+  "_doc": "Copy to /etc/halow/nodes.json with the real bearer token (mesh-v4 config/secrets.env ADMIN_TOKEN). Never commit the real file.",
+  "nodes": [
+    { "name": "node1", "url": "https://192.168.50.103", "token": "CHANGE-ME" },
+    { "name": "node2", "url": "https://192.168.51.104", "token": "CHANGE-ME" }
+  ]
+}

@@ -1,0 +1,7 @@
+# /etc/sudoers.d/halow-ui — the web console's exact privileged surface.
+# Anything not listed here the UI cannot do; keep this list short on purpose.
+halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl gen
+halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl set-profile *
+halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl set *
+halow-ui ALL=(root) NOPASSWD: /usr/sbin/nft list table ip halow
+halow-ui ALL=(root) NOPASSWD: /usr/bin/systemctl restart halow-ap

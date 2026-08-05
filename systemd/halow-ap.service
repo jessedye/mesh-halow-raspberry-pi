@@ -1,0 +1,17 @@
+[Unit]
+Description=HaLow S1G access point (hostapd_s1g on MM6108)
+After=network.target halow-net.service sys-subsystem-net-devices-halow0.device
+Wants=halow-net.service
+# Start/stop with the radio interface itself — no restart-looping while the
+# chip is absent, automatic start the moment the driver probes it.
+BindsTo=sys-subsystem-net-devices-halow0.device
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/halowctl gen
+ExecStart=/usr/local/bin/hostapd_s1g /etc/halow/hostapd_s1g.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=sys-subsystem-net-devices-halow0.device

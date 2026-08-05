@@ -45,3 +45,15 @@ sudo reboot
   submodule, absent from release tarballs), firmware branch `2.0`,
   `bcf_mf08551.bin` from the v1.15.3 BCF release, `morse_cli`, S1G hostap.
   Build friction recorded in `docs/software-stack.md` (KCFLAGS workaround).
+- **2026-08-05 (later)** — Full gateway stack deployed and verified minus RF:
+  profile system (`halowctl`, 4 width tiers), router (nftables NAT +
+  dnsmasq `bind-dynamic` + forwarding), web console on :8443 (HTTPS, basic
+  auth = mesh-v4 admin credential, node proxy verified against node1;
+  node2 was down on the LAN independently). **Chip probe BLOCKED on
+  hardware**: driver + overlay + CS-training patch all verified correct;
+  MISO reads constant 0xFF (nothing driving) while the module drives IRQ
+  high — the mesh-v4 crossed-MISO/MOSI signature. Swap the wires at Pi
+  header pins 19/21 and rerun `scripts/verify.sh`. `halow-ap` is bound to
+  the `halow0` device unit and will start itself the moment the probe
+  succeeds. Temporary MISO hexdump still in the on-Pi driver copy
+  (`~/halow/morse_driver/spi.c`) — remove after first contact.

@@ -1,0 +1,5 @@
+# /etc/udev/rules.d/99-halow-net.rules
+# The morse driver's wlan interface gets a stable name tied to the SPI slot,
+# so config never depends on wlan0/wlan1 enumeration order (the onboard
+# Broadcom already claims wlan0).
+ACTION=="add", SUBSYSTEM=="net", KERNELS=="spi0.0", NAME="halow0"

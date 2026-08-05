@@ -1,0 +1,17 @@
+[Unit]
+Description=HaLow gateway web console
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/halow_ui.py
+Restart=on-failure
+RestartSec=5
+User=halow-ui
+# The UI shells out to a fixed set of privileged commands via sudoers.d/halow-ui
+NoNewPrivileges=no
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

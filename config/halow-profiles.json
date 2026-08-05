@@ -1,0 +1,44 @@
+{
+  "_doc": [
+    "US S1G profiles for the MM6108, keyed by intent (range <-> rate).",
+    "op_class/channel pairs come from Morse's regulatory DB",
+    "(docs/morse-regdb-channels.csv): US 1MHz=68, 2MHz=69, 4MHz=70, 8MHz=71.",
+    "Channels sit at the top of 902-928 to stay clear of the bench's LoRa",
+    "activity lower in the band (mesh-v4 co-siting hazard #119).",
+    "phy_note figures are VENDOR numbers, not measurements - mesh-v4 rule:",
+    "never weight a rung on a datasheet number. Measure before comparing.",
+    "Every valid US channel: 1MHz=odd 1-51; 2MHz=2,6,..,50; 4MHz=8,16,..,48;",
+    "8MHz=12,28,44. Override via 'halowctl set channel=N width=M'."
+  ],
+  "profiles": {
+    "long-range": {
+      "width_mhz": 1,
+      "channel": 45,
+      "op_class": 68,
+      "prim_chwidth": 0,
+      "phy_note": "MCS0@1MHz ~333 kbps, RX sensitivity floor ~-105 dBm [C]"
+    },
+    "mid-range": {
+      "width_mhz": 2,
+      "channel": 46,
+      "op_class": 69,
+      "prim_chwidth": 1,
+      "phy_note": "up to ~7.8 Mbps [C]"
+    },
+    "balanced": {
+      "width_mhz": 4,
+      "channel": 48,
+      "op_class": 70,
+      "prim_chwidth": 1,
+      "phy_note": "up to ~16.2 Mbps [C]"
+    },
+    "max-rate": {
+      "width_mhz": 8,
+      "channel": 44,
+      "op_class": 71,
+      "prim_chwidth": 1,
+      "phy_note": "MCS7@8MHz 32.5 Mbps PHY ceiling [C]; real throughput unmeasured"
+    }
+  },
+  "default": "balanced"
+}

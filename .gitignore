@@ -1,0 +1,7 @@
+# Live secrets never enter this repo (mesh-v4 has leaked a PSK twice;
+# the scan-before-commit rule applies here too).
+halow.env
+secrets.env
+nodes.json
+ui.conf
+*.pem
