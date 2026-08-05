@@ -92,3 +92,10 @@ binaries dropped in place for a minutes-long restore on the same kernel.
   as mapped 5 GHz) and `rsn_pairwise=CCMP`. Cold-reboot verified: 9/9
   verify.sh PASS, halow0 at 10.117.0.1/24, dnsmasq serving, both APs
   (`mesh` HaLow + `mesh-2g` 2.4 GHz) beaconing. Debug hexdump removed.
+
+## Router console
+
+`https://192.168.51.202` (standard port; an nftables redirect lands it on
+the unprivileged listener at :8443, which also still answers directly).
+Login = the mesh-v4 admin credential. Works from the LAN, HaLow clients
+(10.117.0.1), and `mesh-2g` WiFi clients (10.42.0.1).
