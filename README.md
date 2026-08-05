@@ -12,7 +12,7 @@ giving the mesh-v4 transport ladder its HaLow rung.
 
 | Path | What |
 |---|---|
-| `docs/wiring.md` | Debug-board header ↔ Pi pin map (with wire colors), SPI timing, fault history |
+| `docs/wiring.md` | Debug-board header ↔ Pi pin map, SPI timing, fault history |
 | `docs/software-stack.md` | Pinned versions, why each, caveats, regulatory |
 | `overlays/mm610x-spi-overlay.dts` | Device-tree overlay for the SPI wiring |
 | `config/morse.conf` | `/etc/modprobe.d` options (BCF + `country=US`) |
@@ -29,7 +29,7 @@ giving the mesh-v4 transport ladder its HaLow rung.
 - HT-HC01P on Heltec's debug-board 10-pin header, wired per `docs/wiring.md`
 - Onboard 2.4 GHz WiFi AP `mesh-2g` on wlan0 (NM `shared`, 10.42.0.1/24, same passphrase; toggle: `halowctl wifi-ap on|off`)
 
-### Pin locations (as built — colors and full detail in `docs/wiring.md`)
+### Pin locations (full detail in `docs/wiring.md`)
 
 | Debug header | Pi pin | BCM | | Debug header | Pi pin | BCM |
 |---|---|---|---|---|---|---|

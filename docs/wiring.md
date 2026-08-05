@@ -7,25 +7,20 @@ debug board**, so all connections are Dupont jumpers on its labeled
 assignment matches Morse Micro's own Pi HAT (MMECH06 / EKH01), which is
 why Morse's stock `mm610x-spi` overlay works unedited.
 
-## The pin map (as built, with wire colors)
+## The pin map
 
-Debug-board header silkscreen order and the colors on the bench harness:
-
-| Debug header | Wire color | Pi physical pin | Pi BCM | Function |
-|---|---|---|---|---|
-| **3V3** | black | **1** (or 17) | — | 3.3 V power — see power note |
-| **GND** | white | **6** | — | Ground |
-| **INT** | white | **22** | GPIO25 | Interrupt, module → Pi |
-| **RESET** | purple | **29** | GPIO5 | Reset, active-low |
-| **BUSY** | green | **26** | GPIO7 | Busy, module → Pi |
-| **WAKE** | orange | **5** | GPIO3 | Wake, Pi → module |
-| **CLK** | yellow | **23** | GPIO11 | SPI0 SCLK |
-| **MISO** | blue | **21** | GPIO9 | SPI0 MISO, module → Pi |
-| **MOSI** | brown | **19** | GPIO10 | SPI0 MOSI, Pi → module |
-| **CS** | red | **24** | GPIO8 (CE0) | Chip select, active-low (software CS) |
-
-Two same-color whites (GND + INT): if in doubt, beep them — GND reads
-0 Ω to any Pi ground pin.
+| Debug header | Pi physical pin | Pi BCM | Function |
+|---|---|---|---|
+| **3V3** | **1** (or 17) | — | 3.3 V power — see power note |
+| **GND** | **6** | — | Ground |
+| **INT** | **22** | GPIO25 | Interrupt, module → Pi |
+| **RESET** | **29** | GPIO5 | Reset, active-low |
+| **BUSY** | **26** | GPIO7 | Busy, module → Pi |
+| **WAKE** | **5** | GPIO3 | Wake, Pi → module |
+| **CLK** | **23** | GPIO11 | SPI0 SCLK |
+| **MISO** | **21** | GPIO9 | SPI0 MISO, module → Pi |
+| **MOSI** | **19** | GPIO10 | SPI0 MOSI, Pi → module |
+| **CS** | **24** | GPIO8 (CE0) | Chip select, active-low (software CS) |
 
 ## Pi header orientation
 
