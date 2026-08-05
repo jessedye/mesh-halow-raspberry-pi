@@ -466,6 +466,20 @@ def main():
     trf = tr.strip().split(",") if tr and "," in tr else []
     time_synced = bool(trf) and trf[0].upper() != "7F7F0101" \
         and trf[-1] == "Normal"
+    # kernel guard: read-only — the guard owns the response, the monitor
+    # only records state and logs transitions (bounded-heal accounting
+    # stays honest)
+    try:
+        kernel_guard_state = json.load(
+            open("/var/lib/halow/kernel-guard.json"))["state"]
+    except Exception:
+        kernel_guard_state = "unknown"
+    if kernel_guard_state != st.get("kernel_guard_seen", "ok") \
+            and kernel_guard_state != "unknown":
+        subprocess.run(["logger", "-t", "halow-mon",
+                        f"kernel guard: {st.get('kernel_guard_seen', 'ok')}"
+                        f" -> {kernel_guard_state}"])
+    st["kernel_guard_seen"] = kernel_guard_state
     sample = {
         "t": now,
         "load1": float(open("/proc/loadavg").read().split()[0]),
@@ -478,6 +492,7 @@ def main():
         "sta_reachable": sta_reachable,
         "disk_free_mb": free_mb,
         "time_synced": time_synced,
+        "kernel_guard": kernel_guard_state,
         "ap": ap_beaconing, "dnsmasq": dnsmasq_ok, "upstream": upstream_ok,
     }
     # disk low-water: edge-triggered — one logged event per crossing,

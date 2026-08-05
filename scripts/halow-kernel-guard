@@ -1,0 +1,195 @@
+#!/bin/bash
+# halow-kernel-guard — kernel-upgrade safety interlock (roadmap 23).
+#
+# The morse driver is out-of-tree with no DKMS: every kernel bump orphans
+# morse.ko, the halow0 device never appears on the next boot, halow-ap
+# (BindsTo the device) never starts and never FAILS, and the self-healer
+# gates on the interface existing — every recovery layer reports a calm,
+# healthy gateway with a dead radio. This script watches for the event
+# and acts: prebuilt restore -> rebuild -> apt-mark hold + loud alert.
+#
+#   halow-kernel-guard check [--dispatch]  verdict -> state file; --dispatch
+#                                          (apt-hook context) async-rebuilds
+#   halow-kernel-guard boot                running-kernel check + synchronous
+#                                          restore ladder (boot unit)
+#   halow-kernel-guard rebuild KVER        the restore ladder for one kernel
+#   halow-kernel-guard hold|unhold         apt-mark on the two metapackages
+#
+# Secrets: halow.env holds the SAE passphrase — this script GREPS its two
+# keys out and never sources the file; set -x is forbidden here.
+set -euo pipefail
+
+STATE=/var/lib/halow/kernel-guard.json
+ENVF=/etc/halow/halow.env
+TAG=halow-kernel-guard
+METAPKGS="linux-image-rpi-v8 linux-headers-rpi-v8"
+
+policy() { grep -oP '^HALOW_KERNEL_POLICY=\K.*' "$ENVF" 2>/dev/null || echo rebuild; }
+repodir() { grep -oP '^HALOW_REPO_DIR=\K.*' "$ENVF" 2>/dev/null || echo /home/pi/mesh-halow-raspberry-pi; }
+
+has_module() { # has_module KVER
+  compgen -G "/lib/modules/$1/updates/morse.ko*" >/dev/null || \
+  compgen -G "/lib/modules/$1/extra/morse.ko*" >/dev/null
+}
+
+kernels() { # installed kernels (with a kernel/ subdir — filters leftovers)
+  for d in /lib/modules/*/; do
+    [ -d "$d/kernel" ] && basename "$d"
+  done
+}
+
+next_boot_kernel() {
+  if command -v linux-version >/dev/null 2>&1; then
+    kernels | linux-version sort | tail -1
+  else
+    kernels | sort -V | tail -1
+  fi
+}
+
+undervolted() {
+  [ "${HALOW_GUARD_FAKE_THROTTLE:-0}" = 1 ] && return 0
+  local t
+  t=$(vcgencmd get_throttled 2>/dev/null | grep -oP '=\K.*' || echo 0x0)
+  (( (t & 0x1) != 0 ))
+}
+
+write_state() { # write_state STATE POLICY [REBUILD_JSON]
+  local st=$1 pol=$2 rb=${3:-}
+  local run next run_has next_has holds tmp prev
+  run=$(uname -r)
+  next=$(next_boot_kernel)
+  run_has=false; has_module "$run" && run_has=true
+  next_has=false; has_module "$next" && next_has=true
+  # grep must never fail the pipeline: under pipefail its exit-1 on no
+  # matches fired the || fallback AFTER python already printed [] —
+  # double-emitting and corrupting the JSON
+  holds=$(apt-mark showhold 2>/dev/null \
+          | { grep -E "linux-(image|headers)-rpi" || true; } \
+          | python3 -c "import json,sys;print(json.dumps(sys.stdin.read().split()))" \
+          2>/dev/null)
+  [ -n "$holds" ] || holds="[]"
+  prev=$(python3 -c "import json;print(json.load(open('$STATE')).get('state',''))" \
+         2>/dev/null || echo "")
+  [ -n "$rb" ] || rb=$(python3 -c "import json;print(json.dumps(json.load(open('$STATE')).get('last_rebuild')))" \
+                       2>/dev/null || echo null)
+  tmp=$(mktemp /var/lib/halow/kernel-guard.json.XXXX)
+  cat > "$tmp" <<EOF
+{"checked_at": "$(date -Is)", "running_kernel": "$run",
+ "running_has_module": $run_has, "next_boot_kernel": "$next",
+ "next_boot_has_module": $next_has, "state": "$st", "policy": "$pol",
+ "holds": $holds, "last_rebuild": $rb}
+EOF
+  chmod 644 "$tmp"
+  mv "$tmp" "$STATE"
+  if [ "$prev" != "$st" ]; then
+    logger -t "$TAG" "state $prev -> $st (running=$run next=$next)"
+  fi
+}
+
+verdict() {
+  local run next
+  run=$(uname -r); next=$(next_boot_kernel)
+  if ! has_module "$run"; then echo dead
+  elif ! has_module "$next"; then echo orphaned
+  else echo ok
+  fi
+}
+
+do_hold() {
+  # shellcheck disable=SC2086
+  apt-mark hold $METAPKGS >/dev/null 2>&1 || true
+  logger -t "$TAG" "kernel metapackages HELD — driver missing for the next-boot kernel; run 'halowctl driver rebuild' then 'halowctl driver unhold'"
+}
+
+rebuild() { # rebuild KVER — the restore ladder; synchronous
+  local kver=$1 repo t0 secs ok=false owner ohome blog=/var/lib/halow/kernel-rebuild.log
+  repo=$(repodir)
+  # install.sh's work tree is ~/halow OF THE REPO OWNER; running it with
+  # root's HOME looks in /root/halow and fails in 1s (found the hard way)
+  owner=$(stat -c %U "$repo" 2>/dev/null || echo pi)
+  ohome=$(getent passwd "$owner" | cut -d: -f6)
+  if undervolted; then
+    logger -t "$TAG" "REFUSING rebuild for $kver: undervoltage active (a 4-core build during brownout is how boards die) — holding instead"
+    do_hold
+    write_state held "$(policy)"
+    return 1
+  fi
+  write_state rebuilding "$(policy)"
+  t0=$(date +%s)
+  if [ -d "$repo/prebuilt/$kver" ]; then
+    logger -t "$TAG" "prebuilt restore for $kver"
+    if env HOME="$ohome" "$repo/scripts/install.sh" --prebuilt "$kver" \
+        >"$blog" 2>&1; then ok=true; fi
+  elif [ -d "/lib/modules/$kver/build" ]; then
+    logger -t "$TAG" "rebuilding driver for $kver (install.sh --driver-only)"
+    if env HOME="$ohome" "$repo/scripts/install.sh" --driver-only "$kver" \
+        >"$blog" 2>&1; then ok=true; fi
+  else
+    logger -t "$TAG" "no source path for $kver: no prebuilt/$kver and no headers — cannot rebuild"
+  fi
+  if ! $ok && [ -s "$blog" ]; then
+    tail -3 "$blog" | logger -t "$TAG"
+  fi
+  secs=$(( $(date +%s) - t0 ))
+  local rb
+  rb=$(printf '{"kernel": "%s", "ok": %s, "seconds": %d, "at": "%s"}' \
+       "$kver" "$ok" "$secs" "$(date -Is)")
+  if $ok; then
+    logger -t "$TAG" "driver restored for $kver in ${secs}s"
+    write_state "$(verdict)" "$(policy)" "$rb"
+    return 0
+  fi
+  do_hold
+  write_state held "$(policy)" "$rb"
+  return 1
+}
+
+case "${1:-check}" in
+  check)
+    v=$(verdict)
+    pol=$(policy)
+    if [ "$v" = ok ]; then
+      write_state ok "$pol"
+      exit 0
+    fi
+    write_state "$v" "$pol"
+    if [ "${2:-}" = "--dispatch" ] && [ "$pol" = rebuild ]; then
+      target=$(next_boot_kernel)
+      [ "$v" = dead ] && target=$(uname -r)
+      # fixed unit name = the concurrency lock; second dispatch fails clean.
+      # reset-failed first: a FAILED previous rebuild otherwise lingers and
+      # blocks every future dispatch (an ACTIVE one still refuses correctly)
+      systemctl reset-failed halow-kernel-rebuild >/dev/null 2>&1 || true
+      systemd-run --unit=halow-kernel-rebuild -p Nice=10 -p RuntimeMaxSec=1800 \
+        /usr/local/bin/halow-kernel-guard rebuild "$target" >/dev/null 2>&1 \
+        || logger -t "$TAG" "rebuild already running (dispatch skipped)"
+    fi
+    ;;
+  boot)
+    # belt and suspenders: reflash, out-of-band dpkg, or a missed window.
+    if has_module "$(uname -r)"; then
+      write_state "$(verdict)" "$(policy)"
+      exit 0
+    fi
+    logger -t "$TAG" "BOOT CHECK: no morse.ko for running kernel $(uname -r) — the AP cannot come up; attempting restore"
+    if rebuild "$(uname -r)"; then
+      depmod -a
+      modprobe morse && logger -t "$TAG" "morse probed after restore — halow0 should appear and halow-ap self-start"
+    fi
+    ;;
+  rebuild)
+    rebuild "${2:?usage: halow-kernel-guard rebuild KVER}"
+    ;;
+  hold)
+    do_hold
+    write_state held "$(policy)"
+    ;;
+  unhold)
+    # shellcheck disable=SC2086
+    apt-mark unhold $METAPKGS >/dev/null 2>&1 || true
+    logger -t "$TAG" "kernel metapackages unheld"
+    write_state "$(verdict)" "$(policy)"
+    ;;
+  *)
+    sed -n '2,17p' "$0"; exit 1 ;;
+esac

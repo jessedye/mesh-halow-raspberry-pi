@@ -9,6 +9,7 @@
 #   halowctl stations          associated STA dump
 #   halowctl join-log [mac|--all|--selftest]  association forensics (read-only)
 #   halowctl health            station health ladder view (read-only)
+#   halowctl driver status|rebuild [KVER]|hold|unhold  kernel-upgrade interlock
 #   halowctl mode ap|sta       broadcast the SSID, or join it as a station
 #   halowctl probe             reload the driver and report chip probe result
 #   halowctl restart|stop      control the AP service
@@ -287,6 +288,36 @@ PY
     shift
     exec /usr/local/bin/halow-join-log "$@"
     ;;
+  driver)
+    sub=${2:-status}
+    case "$sub" in
+      status)
+        if [ -f /var/lib/halow/kernel-guard.json ]; then
+          python3 - <<'PY'
+import json
+d = json.load(open("/var/lib/halow/kernel-guard.json"))
+print(f"state: {d['state']}  (checked {d['checked_at']})")
+print(f"running:   {d['running_kernel']}  module: {d['running_has_module']}")
+print(f"next boot: {d['next_boot_kernel']}  module: {d['next_boot_has_module']}")
+if d.get("holds"): print("HELD:", " ".join(d["holds"]), "- 'halowctl driver unhold' after fixing")
+lr = d.get("last_rebuild")
+if lr: print(f"last rebuild: {lr['kernel']} ok={lr['ok']} {lr['seconds']}s at {lr['at']}")
+PY
+        else
+          # box without the guard: fall back to the direct check
+          K=$(uname -r)
+          compgen -G "/lib/modules/$K/updates/morse.ko*" >/dev/null || \
+          compgen -G "/lib/modules/$K/extra/morse.ko*" >/dev/null || \
+            echo "!! NO morse.ko FOR RUNNING KERNEL $K"
+          echo "(no kernel-guard state file — guard not deployed?)"
+        fi
+        ;;
+      rebuild) sudo /usr/local/bin/halow-kernel-guard rebuild "${3:-$(uname -r)}" ;;
+      hold)    sudo /usr/local/bin/halow-kernel-guard hold ;;
+      unhold)  sudo /usr/local/bin/halow-kernel-guard unhold ;;
+      *) echo "usage: halowctl driver status|rebuild [KVER]|hold|unhold"; exit 1 ;;
+    esac
+    ;;
   health)
     python3 - <<'PY'
 import json, time
@@ -554,11 +585,16 @@ for r in json.load(open("/etc/halow/forwards.json")):
   stop) sudo systemctl stop halow-ap ;;
   status)
     K=$(uname -r)
-    # compgen, not ls: 'ls A* B*' fails when EITHER glob is empty, and the
-    # module lives only in updates/ — that false-fired on every healthy boot.
-    compgen -G "/lib/modules/$K/updates/morse.ko*" >/dev/null || \
-    compgen -G "/lib/modules/$K/extra/morse.ko*" >/dev/null || \
-      echo "!! NO morse.ko FOR RUNNING KERNEL $K — a kernel upgrade orphaned the driver; run install.sh --driver-only (or --prebuilt) BEFORE the next reboot"
+    if [ -f /var/lib/halow/kernel-guard.json ]; then
+      GS=$(python3 -c "import json;print(json.load(open('/var/lib/halow/kernel-guard.json'))['state'])" 2>/dev/null || echo unknown)
+      [ "$GS" = ok ] || echo "!! KERNEL GUARD: state=$GS — see 'halowctl driver status'"
+    else
+      # compgen, not ls: 'ls A* B*' fails when EITHER glob is empty, and the
+      # module lives only in updates/ — that false-fired on every healthy boot.
+      compgen -G "/lib/modules/$K/updates/morse.ko*" >/dev/null || \
+      compgen -G "/lib/modules/$K/extra/morse.ko*" >/dev/null || \
+        echo "!! NO morse.ko FOR RUNNING KERNEL $K — a kernel upgrade orphaned the driver; run install.sh --driver-only (or --prebuilt) BEFORE the next reboot"
+    fi
     echo "== interface"; ip -br addr show "${HALOW_IF:-halow0}" 2>/dev/null || echo "  ${HALOW_IF:-halow0}: ABSENT (driver not probed?)"
     echo "== AP service"; systemctl is-active halow-ap 2>/dev/null || true
     echo "== config"; resolve; echo "  ssid=${HALOW_SSID} profile=${HALOW_PROFILE:-default} ch=$CH op=$OP width=${WIDTH}MHz"

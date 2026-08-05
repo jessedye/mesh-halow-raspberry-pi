@@ -35,6 +35,7 @@ chk "chrony local holdover directive effective" sh -c 'sudo chronyd -p 2>/dev/nu
 # monolithic unit — test the load unit, fall back to the old name.
 chk "fake-hwclock enabled" sh -c 'systemctl is-enabled fake-hwclock-load.service 2>/dev/null | grep -E "enabled|static" || systemctl is-enabled fake-hwclock 2>/dev/null | grep -E "^enabled|^static"'
 chk "chronyc answers (tracking)" sh -c 'chronyc -c tracking | head -1'
+chk "kernel guard state ok" sh -c 'grep -o "\"state\": \"ok\"" /var/lib/halow/kernel-guard.json'
 echo
 journalctl -k -q --no-pager -g "morse" -n 10
 exit $fail

@@ -29,7 +29,8 @@ fetch() { # fetch <name> <giturl> <ref> <vendor-tarball-glob>
   fi
 }
 
-driver_build() {
+driver_build() { # driver_build [KVER] — defaults to the running kernel
+  local KVER=${1:-$(uname -r)}
   cd "$WORK/morse_driver"
   # rate-control submodule is NOT in release tarballs and must match the pin
   if [ ! -f mmrc-submodule/src/core/mmrc.h ]; then
@@ -46,23 +47,27 @@ driver_build() {
   # KCFLAGS: stock kernels lack Morse's SPI_CONTROLLER_ENABLE_CS_GPIOD patch;
   # the driver #warns about it and Pi OS builds with warnings-as-errors.
   # The fallback (gpiolib handles CS polarity from the DT flag) is correct.
-  make -j"$(nproc)" KERNEL_SRC=/lib/modules/"$(uname -r)"/build \
+  make -j"$(nproc)" KERNEL_SRC=/lib/modules/"$KVER"/build \
     KCFLAGS=-Wno-error=cpp \
     CONFIG_WLAN_VENDOR_MORSE=m CONFIG_MORSE_SDIO=y CONFIG_MORSE_SPI=y \
     CONFIG_MORSE_USER_ACCESS=y CONFIG_MORSE_VENDOR_COMMAND=y
-  sudo make KERNEL_SRC=/lib/modules/"$(uname -r)"/build modules_install
-  sudo depmod -a
+  sudo make KERNEL_SRC=/lib/modules/"$KVER"/build modules_install
+  sudo depmod -a "$KVER"
 }
 
-if [ "${1:-}" = "--driver-only" ]; then driver_build; echo "driver reinstalled for $(uname -r)"; exit 0; fi
+if [ "${1:-}" = "--driver-only" ]; then
+  driver_build "${2:-$(uname -r)}"
+  echo "driver reinstalled for ${2:-$(uname -r)}"
+  exit 0
+fi
 
-# Minutes-long restore from the repo's archived binaries (same kernel only)
+# Minutes-long restore from the repo's archived binaries (matching kernel only)
 if [ "${1:-}" = "--prebuilt" ]; then
-  K=$(uname -r)
+  K=${2:-$(uname -r)}
   [ -d "$REPO_DIR/prebuilt/$K" ] || { echo "no prebuilt modules for $K — full build required"; exit 1; }
   sudo install -D -m644 "$REPO_DIR/prebuilt/$K/morse.ko"   "/lib/modules/$K/updates/morse.ko"
   sudo install -D -m644 "$REPO_DIR/prebuilt/$K/dot11ah.ko" "/lib/modules/$K/updates/dot11ah.ko"
-  sudo depmod -a
+  sudo depmod -a "$K"
   sudo tar -C /usr/local/bin -xzf "$REPO_DIR/prebuilt/s1g-bins.tar.gz"
   echo "prebuilt modules + S1G binaries installed for $K"
   exit 0

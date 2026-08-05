@@ -94,3 +94,14 @@ Coordination flag for mesh-v4: Meshtastic ignores DHCP option 42
 (WiFiAPClient.cpp uses `config.network.ntp_server`) — the nodes must set
 `network.ntp_server = 10.117.0.1` or they will chase the default pool
 through NAT, which dies exactly when the upstream does.
+
+
+## Kernel-upgrade interlock (roadmap 23)
+
+No DKMS, by choice — the KCFLAGS workaround and mmrc pin live in
+install.sh, and carrying them inside dpkg triggers means debugging them
+blind. Instead `halow-kernel-guard` watches for orphaned modules (apt
+Post-Invoke + boot unit), restores via prebuilt/ (4s [M]) or
+install.sh --driver-only (18s warm [M]), and apt-mark holds the kernel
+metapackages when it cannot. State: /var/lib/halow/kernel-guard.json;
+`halowctl driver status|rebuild|hold|unhold`.

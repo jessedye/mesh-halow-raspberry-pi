@@ -1,0 +1,11 @@
+[Unit]
+Description=HaLow kernel-guard boot check (restore morse.ko if the running kernel lacks it)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/halow-kernel-guard boot
+
+[Install]
+WantedBy=multi-user.target

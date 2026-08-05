@@ -1209,6 +1209,38 @@ def api_node_proxy(name, sub):
 
 # ---------- System ----------
 
+def _kernel_guard():
+    """kernel-guard.json passthrough; missing file is a warning, never
+    silently ok — a box without the guard deployed should say so."""
+    try:
+        return json.load(open("/var/lib/halow/kernel-guard.json"))
+    except Exception:
+        return {"state": "unknown"}
+
+
+@app.post("/api/system/driver-rebuild")
+@authed
+def api_driver_rebuild():
+    subprocess.Popen(["sudo", "/usr/local/bin/halowctl", "driver",
+                      "rebuild"])
+    return jsonify({"ok": True, "output": "rebuild dispatched — watch "
+                    "kernel_guard.state (rebuilding -> ok/held)"})
+
+
+@app.post("/api/system/driver-hold")
+@authed
+def api_driver_hold():
+    if request.form.get("confirm") != "1":
+        return jsonify({"error": "needs confirm=1: changes apt kernel "
+                        "policy"}), 400
+    op = request.form.get("op", "hold")
+    if op not in ("hold", "unhold"):
+        return jsonify({"error": "op must be hold or unhold"}), 400
+    ok, out = halowctl(["driver", op])
+    return (jsonify({"ok": True, "output": out}) if ok
+            else (jsonify({"error": out}), 500))
+
+
 def time_sync():
     """chrony tracking -> synced|holdover|unknown + the raw fields.
     Raw values are always exposed beside the classification (detect the
@@ -1253,6 +1285,7 @@ def api_system():
         "mem": mem,
         "temp": sh("cat /sys/class/thermal/thermal_zone0/temp").strip(),
         "kernel": sh("uname -r").strip(),
+        "kernel_guard": _kernel_guard(),
         "time_sync": time_sync(),
         "disk": {"total_mb": total_mb, "free_mb": free_mb,
                  "used_pct": round(100 * (1 - free_mb / total_mb), 1)
@@ -1468,6 +1501,10 @@ async function logsLoad(){const u=$("#l-unit").value;
  $("#l-out").textContent=d.lines.join("\n")||"(empty)"}
 async function joinDetail(m){const d=await j("/api/halow/join-log/"+m);
  $("#jl-out").textContent=JSON.stringify(d,null,1)}
+async function drvRebuild(btn){btn.disabled=true;
+ try{const r=await(await fetch("/api/system/driver-rebuild",{method:"POST"})).json();
+ const el=document.getElementById("drv-out");if(el)el.textContent=r.error||r.output;
+ setTimeout(render,5000)}finally{btn.disabled=false}}
 async function ltSelf(btn){btn.disabled=true;btn.textContent="running…";
  try{const r=await(await fetch("/api/halow/linktest/selftest",{method:"POST"})).json();
  $("#lt-out").textContent=JSON.stringify(r,null,1)}
@@ -1547,6 +1584,10 @@ async function ovw(){const s=await j("/api/system"),h=await j("/api/halow");
  <div class="stat"><div class="v ${h.ap_active==='active'?'ok':'warn'}">${esc(h.ap_active)}</div><div class="k">AP service</div></div>
  <div class="stat"><div class="v ${s.time_sync.state==='synced'?'ok':s.time_sync.state==='holdover'?'warn':'bad'}">${s.time_sync.state==='synced'?('s'+s.time_sync.stratum):s.time_sync.state==='holdover'?'HOLDOVER':'no time'}</div><div class="k">NTP</div></div>
  </div></div>
+ ${s.kernel_guard.state!=="ok"?`<div class="card"><h2 class="${s.kernel_guard.state==="unknown"?"warn":"bad"}">kernel guard: ${esc(s.kernel_guard.state)}</h2>
+ <p>${s.kernel_guard.state==="unknown"?"guard state file missing — guard not deployed or never ran":
+ `next-boot kernel ${esc(s.kernel_guard.next_boot_kernel||"?")} module=${s.kernel_guard.next_boot_has_module} · running ${esc(s.kernel_guard.running_kernel||"?")} module=${s.kernel_guard.running_has_module} — a reboot in this state kills the AP`}</p>
+ <p><button class="act" onclick="drvRebuild(this)">rebuild driver</button></p><pre id="drv-out"></pre></div>`:""}
  <div class="card"><h2>kernel / disk</h2><pre>${esc(s.kernel)}  root <span class="${s.disk.low?'bad':'ok'}">${s.disk.free_mb} MB free</span> of ${s.disk.total_mb} MB (${s.disk.used_pct}% used)${s.disk.low?' — BELOW '+s.disk.low_water_mb+' MB LOW-WATER':''}</pre></div>
  ${await monCard()}`}
 async function monCard(){try{const m=await j("/api/metrics?minutes=1440");

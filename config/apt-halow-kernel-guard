@@ -1,0 +1,6 @@
+// /etc/apt/apt.conf.d/99halow-kernel-guard — detect an orphaned morse.ko
+// at the causal moment (covers unattended-upgrades too). MUST never block
+// or fail apt: detection is milliseconds, rebuilds dispatch async via
+// systemd-run, and the unconditional '|| true' is load-bearing — a failing
+// Post-Invoke breaks package management on a remote gateway.
+DPkg::Post-Invoke { "/usr/local/bin/halow-kernel-guard check --dispatch || true"; };

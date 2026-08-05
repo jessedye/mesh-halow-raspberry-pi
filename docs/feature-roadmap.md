@@ -249,7 +249,20 @@ nothing on the v1 rejected list); verifier corrections are folded in.
     (meshdata.py convention), logrotate for the unbounded
     station-events.log, journald SystemMaxUse, disk low-water in
     /api/system. [medium/medium]
-23. **Kernel-upgrade safety interlock** — no DKMS; every kernel bump
+23. **Kernel-upgrade safety interlock** — DONE 2026-08-05 (halow-kernel-guard:
+    apt Post-Invoke hook (421ms detection, never blocks apt) + boot unit +
+    restore ladder prebuilt->rebuild->hold. Drilled [M]: fake 6.99.0-test
+    kernel -> orphaned -> no-source -> held with both metapackages;
+    dead-kernel (morse.ko removed) -> boot check -> prebuilt restore 4s ->
+    modprobe -> AP active; full driver rebuild 18s with warm work tree
+    (52->58C); concurrency lock holds vs an active rebuild (and a
+    lingering FAILED transient unit no longer blocks dispatch —
+    reset-failed first); undervoltage gate refuses builds during
+    brownout; zero PSK hits in journal+state. Two bugs found by the
+    drills: pipefail double-emit corrupted the state JSON; install.sh
+    run as root looked for /root/halow — the guard now runs it with the
+    repo owner's HOME. verify.sh 14/14. End-to-end unattended-kernel-bump
+    run (A9) awaits a joined station.) — no DKMS; every kernel bump
     orphans morse.ko and the only guard is a warning inside `halowctl
     status` a human must run — while deploy.sh apt-get installs on every
     deploy. apt Post-Invoke hook or /lib/modules path unit: auto-rebuild
