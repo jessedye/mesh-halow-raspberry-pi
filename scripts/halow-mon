@@ -19,6 +19,7 @@ STATE = os.path.join(STATE_DIR, "mon-state.json")
 HEALTH = os.path.join(STATE_DIR, "station-health.json")
 EVENTS_LOG = os.path.join(STATE_DIR, "station-events.log")
 RUNGCOST = os.path.join(STATE_DIR, "rungcost-state.json")
+BROWNOUT = os.path.join(STATE_DIR, "brownout.jsonl")
 RING_LINES = 2880  # 2 days at 1/min
 UPSTREAM = "192.168.50.1"
 DISK_LOW_MB = 512  # SD low-water; mirrored in halow_ui.py
@@ -38,6 +39,8 @@ PRUNE_UNKNOWN_S = 86400
 DEFAULTS = {"ap_restarts": 0, "dnsmasq_restarts": 0, "eth0_bounces": 0,
             "ap_down_streak": 0, "upstream_down_streak": 0,
             "last_eth0_bounce": 0, "disk_low": False, "disk_low_events": 0,
+            "uv_active": False, "uv_since": 0, "uv_count": 0,
+            "uv_last_raw": 0, "uv_last_t": 0,
             "actions": []}
 
 
@@ -184,6 +187,50 @@ def classify(assoc, ip, arp_ok, icmp_ok, last_seen_assoc, interval_s, now,
     if now - last_seen_assoc <= HOLD_MULTIPLIER * interval_s:
         return "quiet", ""
     return "lost", f"silent past {HOLD_MULTIPLIER}x{interval_s}s"
+
+
+def brownout_ledger(st, thr_hex, now):
+    """Transitions of get_throttled bit 0 (undervoltage NOW) into a
+    persisted event ledger. Bit 16 (occurred-since-boot) latches until
+    reboot: a rising edge WITHIN one boot is a sub-minute blip that bit 0
+    never caught; across a reboot it means nothing. uv_count is a lower
+    bound, never a flap count (the 1-minute cadence undercounts)."""
+    try:
+        val = int(thr_hex, 16)
+    except (TypeError, ValueError):
+        return  # vcgencmd unavailable: fail open, never brick diagnostics
+    boot_t = now - float(open("/proc/uptime").read().split()[0])
+    prev = st.get("uv_last_raw", 0)
+    if st.get("uv_last_t", 0) < boot_t:
+        prev = 0  # previous sample was another boot; latched bits reset
+    now_bit = bool(val & 0x1)
+    occ_rose = bool(val & 0x10000) and not (prev & 0x10000)
+    ev = None
+    if now_bit and not st.get("uv_active"):
+        st["uv_active"], st["uv_since"] = True, now
+        st["uv_count"] = st.get("uv_count", 0) + 1
+        ev = {"t": now, "event": "undervolt_start", "raw": hex(val)}
+    elif not now_bit and st.get("uv_active"):
+        st["uv_active"] = False
+        ev = {"t": now, "event": "undervolt_end",
+              "dur_s": now - st.get("uv_since", now), "raw": hex(val)}
+    elif not now_bit and occ_rose:
+        st["uv_count"] = st.get("uv_count", 0) + 1
+        ev = {"t": now, "event": "undervolt_blip", "raw": hex(val),
+              "note": "occurred-bit rose between samples; sub-minute event"}
+    st["uv_last_raw"], st["uv_last_t"] = val, now
+    if ev:
+        subprocess.run(["logger", "-t", "halow-mon",
+                        f"brownout: {ev['event']} raw={ev['raw']}"])
+        with open(BROWNOUT, "a") as f:
+            f.write(json.dumps(ev) + "\n")
+        os.chmod(BROWNOUT, 0o644)
+        try:
+            lines = open(BROWNOUT).readlines()
+            if len(lines) > 1200:
+                atomic_write(BROWNOUT, "".join(lines[-1000:]))
+        except OSError:
+            pass
 
 
 def rungcost_step(parsed, now):
@@ -495,6 +542,8 @@ def main():
         "kernel_guard": kernel_guard_state,
         "ap": ap_beaconing, "dnsmasq": dnsmasq_ok, "upstream": upstream_ok,
     }
+    brownout_ledger(st, sample["throttled"], now)
+
     # disk low-water: edge-triggered — one logged event per crossing,
     # never one per minute
     low = free_mb < DISK_LOW_MB

@@ -3,7 +3,12 @@ Description=HaLow gateway web console
 After=network.target
 
 [Service]
-Type=simple
+# notify: the app's pet thread sends READY=1 only once it verifies itself
+# serving (/healthz self-probe) and WATCHDOG=1 per verified probe — missed
+# pets for 60 s SIGABRT the service and Restart=on-failure revives it.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 ExecStart=/usr/bin/python3 /usr/local/lib/halow_ui.py
 Restart=on-failure
 RestartSec=5

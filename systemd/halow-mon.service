@@ -3,4 +3,10 @@ Description=HaLow gateway metrics sampler and self-healing monitor
 
 [Service]
 Type=oneshot
+# Oneshot start-timeout defaults to INFINITY, and halow-mon makes
+# unbounded blocking systemctl/nmcli calls — one hung restart would
+# stall the sampling AND healing chain forever (OnUnitActiveSec never
+# re-fires while the unit is 'activating'). RuntimeMaxSec is a
+# documented no-op for oneshot; TimeoutStartSec is the real knob.
+TimeoutStartSec=50
 ExecStart=/usr/local/bin/halow-mon

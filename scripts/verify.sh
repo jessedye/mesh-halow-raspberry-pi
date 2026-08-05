@@ -36,6 +36,10 @@ chk "chrony local holdover directive effective" sh -c 'sudo chronyd -p 2>/dev/nu
 chk "fake-hwclock enabled" sh -c 'systemctl is-enabled fake-hwclock-load.service 2>/dev/null | grep -E "enabled|static" || systemctl is-enabled fake-hwclock 2>/dev/null | grep -E "^enabled|^static"'
 chk "chronyc answers (tracking)" sh -c 'chronyc -c tracking | head -1'
 chk "kernel guard state ok" sh -c 'grep -o "\"state\": \"ok\"" /var/lib/halow/kernel-guard.json'
+chk "hardware watchdog device" ls /dev/watchdog0
+chk "systemd runtime watchdog 15s" sh -c 'systemctl show -p RuntimeWatchdogUSec | grep -E "=15s"'
+# WatchdogTimestampMonotonic nonzero = a pet was RECEIVED, not merely sent
+chk "halow-ui watchdog pet received" sh -c 'v=$(systemctl show halow-ui -p WatchdogTimestampMonotonic --value); [ "${v:-0}" -gt 0 ] && echo "pet at $v"'
 echo
 journalctl -k -q --no-pager -g "morse" -n 10
 exit $fail

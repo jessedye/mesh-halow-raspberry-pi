@@ -385,7 +385,10 @@ PY
     SECS=${2:-10}
     [[ "$SECS" =~ ^[0-9]+$ ]] && [ "$SECS" -ge 3 ] && [ "$SECS" -le 30 ] || { echo "seconds 3-30"; exit 1; }
     OUT=/var/lib/halow/capture.pcap
-    sudo timeout "$SECS" tcpdump -i "${HALOW_IF:-halow0}" -c 5000 -w "$OUT" 2>&1 | tail -2
+    # timeout exits 124 when it ends a timed capture — the NORMAL case on
+    # a quiet interface (only a 5000-frame cap exits 0); don't let set -e
+    # turn a successful capture into an API 500
+    sudo timeout "$SECS" tcpdump -i "${HALOW_IF:-halow0}" -c 5000 -w "$OUT" 2>&1 | tail -2 || true
     sudo chmod 644 "$OUT" 2>/dev/null
     ls -la "$OUT" 2>/dev/null || echo "no capture produced"
     ;;

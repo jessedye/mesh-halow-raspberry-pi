@@ -57,6 +57,53 @@ app.config.update(
 )
 
 
+def _sd_notify(msg):
+    """Pure-Python sd_notify: AF_UNIX datagram to $NOTIFY_SOCKET (with the
+    abstract-namespace @ prefix). No-op without the env var, so running
+    'python3 halow_ui.py' by hand still works."""
+    import socket as _socket
+    path = os.environ.get("NOTIFY_SOCKET")
+    if not path:
+        return
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_DGRAM)
+        s.sendto(msg, "\0" + path[1:] if path.startswith("@") else path)
+        s.close()
+    except OSError:
+        pass
+
+
+def _watchdog_thread(scheme):
+    """Pet systemd only after verifying we actually serve: a real local
+    /healthz request each WATCHDOG_USEC/3. On probe failure send nothing —
+    60s of missed pets SIGABRTs the service and Restart revives it. First
+    success sends READY=1 so systemd counts us started only once serving."""
+    import urllib.request
+    usec = int(os.environ.get("WATCHDOG_USEC", "60000000"))
+    interval = max(usec // 3 // 1_000_000, 5)
+    sctx = ssl._create_unverified_context() if scheme == "https" else None
+    ready = False
+    while True:
+        try:
+            r = urllib.request.urlopen(f"{scheme}://127.0.0.1:8443/healthz",
+                                       timeout=5, context=sctx)
+            if r.status == 200:
+                if not ready:
+                    _sd_notify(b"READY=1")
+                    ready = True
+                _sd_notify(b"WATCHDOG=1")
+        except Exception:
+            pass
+        time.sleep(interval)
+
+
+@app.get("/healthz")
+def healthz():
+    # unauthenticated constant by design: the watchdog self-probe target.
+    # No version, no uptime, no config — nothing for the secrets rule.
+    return Response("ok", mimetype="text/plain")
+
+
 def sh(cmd, timeout=10):
     """Run a command, return stdout ('' on any failure — UI shows absence)."""
     try:
@@ -264,6 +311,17 @@ def api_halow_profile():
     name = request.form.get("name", "")
     if not _re.match(r"^[A-Za-z0-9-]+$", name):
         return jsonify({"error": "bad profile name"}), 400
+    # brownout policy: only widths >=8 MHz decline — switching DOWN to
+    # long-range is the remediation path and must never be blocked
+    try:
+        width = json.load(open(PROFILES))["profiles"].get(
+            name, {}).get("width_mhz", 0)
+    except Exception:
+        width = 0
+    if width >= 8:
+        d = _decline_high_draw(f"profile apply ({width}MHz)")
+        if d:
+            return d
     args = ["set-profile", name]
     if request.form.get("confirm") == "1":
         args.append("confirm=1")
@@ -535,6 +593,12 @@ def api_config_reservations():
 @authed
 def api_diag_capture():
     secs = request.form.get("seconds", "10")
+    # short captures stay allowed under brownout: debugging the brownout
+    # may need receiver-side eyes
+    if secs.isdigit() and int(secs) > 10:
+        d = _decline_high_draw(f"capture {secs}s (>10s)")
+        if d:
+            return d
     ok, o = halowctl(["capture", secs], timeout=45)
     return (jsonify({"ok": True, "output": o, "download": "/api/diag/capture"})
             if ok else (jsonify({"error": o}), 500))
@@ -575,6 +639,9 @@ DISK_LOW_MB = 512  # SD low-water; mirrored in scripts/halow-mon
 @app.post("/api/halow/throughput")
 @authed
 def api_halow_throughput():
+    d = _decline_high_draw("iperf3 run")  # sustained TX saturation:
+    if d:                                 # exactly the 200-250mA burst case
+        return d
     target = request.form.get("target", "")
     import re as _re
     if not _re.match(r"^[0-9.]+$", target):
@@ -919,13 +986,77 @@ def api_diag_power():
     val = int(m.group(1), 16) if m else None
     flags = ([THROTTLE_BITS[b] for b in THROTTLE_BITS if val & (1 << b)]
              if val is not None else ["vcgencmd unavailable"])
+    uv_count = 0
+    try:
+        uv_count = json.load(open("/var/lib/halow/mon-state.json")
+                             ).get("uv_count", 0)
+    except Exception:
+        pass
     return jsonify({
         "throttled_raw": raw or None,
         "flags": flags or ["clean — no undervoltage or throttling recorded"],
+        "undervolt_now": bool(val & 0x1) if val is not None else False,
+        "brownout_count": uv_count,
         "temp_c": round(int(open("/sys/class/thermal/thermal_zone0/temp")
                             .read()) / 1000, 1),
         "volts_core": sh("vcgencmd measure_volts core").strip() or None,
     })
+
+
+def _undervolt_now():
+    """Live get_throttled bit 0 — never bit 16, which latches until
+    reboot and would refuse forever. Empty output fails OPEN: absence of
+    evidence is not evidence, and the watchdog covers a dead monitor."""
+    out = sh("vcgencmd get_throttled")
+    try:
+        return bool(int(out.split("=")[-1], 16) & 0x1)
+    except (ValueError, IndexError):
+        return False
+
+
+def _decline_high_draw(op):
+    """409 while the 3V3 rail sags. The error is a FIXED string: no env
+    values, no command output. SSH/halowctl stay ungated root paths — a
+    policy with a web-side bypass is theater, so there is no force=1."""
+    if not _undervolt_now():
+        return None
+    return (jsonify({
+        "error": "undervoltage active (get_throttled bit 0): refusing "
+                 f"{op}. MM6108 TX bursts ~200-250 mA on the Pi 3V3 "
+                 "header pin (docs/wiring.md) and this bench has browned "
+                 "out two boards. Fix power first; history at "
+                 "/api/diag/brownouts.",
+        "declined": op, "policy": "brownout-high-draw"}), 409)
+
+
+@app.get("/api/diag/brownouts")
+@authed
+def api_diag_brownouts():
+    st = {}
+    try:
+        st = json.load(open("/var/lib/halow/mon-state.json"))
+    except Exception:
+        pass
+    events = []
+    try:
+        for line in open("/var/lib/halow/brownout.jsonl").readlines()[-50:]:
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                pass
+    except OSError:
+        pass
+    return jsonify({
+        "active": bool(st.get("uv_active")),
+        "since": st.get("uv_since") or None,
+        "count": st.get("uv_count", 0),
+        "last_event": events[-1] if events else None,
+        "events": events,
+        "live": {"throttled_raw": sh("vcgencmd get_throttled").strip(),
+                 "undervolt_now": _undervolt_now()},
+        "policy": {"declines_while_active":
+                   ["profile apply width>=8MHz", "capture>10s",
+                    "throughput runs"]}})
 
 
 @app.get("/api/diag/flows")
@@ -1388,6 +1519,7 @@ async function render(){nav();const m=$("#main");m.innerHTML="<p class='warn'>lo
  else if(tab==="Diag")m.innerHTML=await diag();
  else m.innerHTML=await nodes();}catch(e){m.innerHTML=`<p class="bad">${esc(e)}</p>`}}
 async function diag(){const nb=await j("/api/diag/neigh"),sv=await j("/api/diag/survey"),pw=await j("/api/diag/power");
+ let bo={count:0,active:false};try{bo=await j("/api/diag/brownouts")}catch(e){}
  const neigh=nb.neighbors.length?nb.neighbors.map(x=>{
   const c=x.state==="REACHABLE"?"ok":(x.state==="FAILED"?"bad":"warn");
   return `<tr><td>${esc(x.ip)}</td><td>${esc(x.dev)}</td><td>${esc(x.mac)}</td><td class="${c}">${esc(x.state)}</td></tr>`}).join("")
@@ -1411,7 +1543,8 @@ async function diag(){const nb=await j("/api/diag/neigh"),sv=await j("/api/diag/
  view stays useful when the timer itself is suspect.</p></div>
  <div class="card"><h2>power / throttling</h2>
  <p>${pw.temp_c}°C · ${esc(pw.volts_core||"")} · ${pw.flags.map(f=>
-  `<span class="${f.includes("NOW")?"bad":(f.includes("occurred")?"warn":"ok")}">${esc(f)}</span>`).join(" · ")}</p></div>
+  `<span class="${f.includes("NOW")?"bad":(f.includes("occurred")?"warn":"ok")}">${esc(f)}</span>`).join(" · ")}</p>
+ <p>brownouts: ${bo.count}${bo.active?' <span class="bad">UNDERVOLTAGE ACTIVE — high-draw ops declined</span>':''}${bo.last_event?` (last: ${esc(bo.last_event.event)} ${new Date(bo.last_event.t*1000).toISOString().slice(5,16).replace("T"," ")})`:''}</p></div>
  <div class="card"><h2>channel survey</h2>
  <p>utilization: ${sv.utilization_pct!=null?sv.utilization_pct+"%":"n/a"}</p>
  <pre>${esc(sv.surveys.map(s=>JSON.stringify(s)).join("\n").slice(0,1500))}</pre></div>
@@ -1722,4 +1855,7 @@ if __name__ == "__main__":
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert, key)
     # threaded: a slow node-proxy call must not stall the whole console
+    import threading
+    threading.Thread(target=_watchdog_thread,
+                     args=("https" if ctx else "http",), daemon=True).start()
     app.run(host="0.0.0.0", port=8443, ssl_context=ctx, threaded=True)

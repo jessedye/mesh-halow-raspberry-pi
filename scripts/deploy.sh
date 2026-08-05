@@ -65,6 +65,11 @@ sudo systemctl enable --now fake-hwclock >/dev/null 2>&1 || true
 sudo install -m644 config/logrotate-halow /etc/logrotate.d/halow
 sudo mkdir -p /etc/systemd/journald.conf.d
 sudo install -m644 config/journald-halow.conf /etc/systemd/journald.conf.d/halow.conf
+# Persistent journal (capped at SystemMaxUse=100M): the 2026-08-05 power
+# cut proved a volatile journal cannot say how the previous boot ended —
+# exactly the evidence a watchdog-reset investigation needs.
+sudo mkdir -p /var/log/journal
+sudo systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 sudo systemctl restart systemd-journald
 sudo journalctl --vacuum-size=100M >/dev/null 2>&1 || true
 sudo sed -i "s/^#host-name=.*/host-name=halow-gw/" /etc/avahi/avahi-daemon.conf
@@ -79,6 +84,8 @@ sudo install -m755 scripts/halow-linkd /usr/local/bin/
 sudo install -m755 scripts/halow_rungcost.py /usr/local/bin/
 sudo install -m755 scripts/halow-kernel-guard /usr/local/bin/
 sudo install -m644 config/apt-halow-kernel-guard /etc/apt/apt.conf.d/99halow-kernel-guard
+sudo mkdir -p /etc/systemd/system.conf.d
+sudo install -m644 config/watchdog-system.conf /etc/systemd/system.conf.d/50-halow-watchdog.conf
 sudo mkdir -p /var/lib/halow && sudo chown halow-ui:halow-ui /var/lib/halow
 sudo install -m440 config/sudoers-halow-ui /etc/sudoers.d/halow-ui
 sudo mkdir -p /usr/local/lib && sudo install -m644 ui/halow_ui.py /usr/local/lib/
@@ -90,6 +97,8 @@ sudo chgrp halow-ui /etc/halow/ui.conf && sudo chmod 640 /etc/halow/ui.conf
 sudo chgrp halow-ui /etc/halow/ui-key.pem /etc/halow/ui-cert.pem && sudo chmod 640 /etc/halow/ui-key.pem
 sudo udevadm control --reload
 sudo systemctl daemon-reload
+# [Manager] watchdog keys need a reexec — daemon-reload is not sufficient
+sudo systemctl daemon-reexec
 sudo systemctl enable halow-net halow-ap halow-ui dnsmasq halow-iperf3 halow-sta-events halow-join-watch halow-linkd halow-kernel-guard halow-mon.timer >/dev/null 2>&1
 sudo systemctl start halow-kernel-guard || true
 sudo systemctl restart halow-linkd || true
@@ -101,4 +110,6 @@ echo INSTALLED'
 
 echo "== verify"
 ssh "$PI" 'systemctl is-active halow-net halow-ui dnsmasq halow-ap || true;
+systemctl show -p RuntimeWatchdogUSec || true;
+grep -q "^dtparam=watchdog=on" /boot/firmware/config.txt || echo "WARN: dtparam=watchdog=on not in /boot/firmware/config.txt (manual append + reboot)";
 curl -sk -o /dev/null -w "UI https: %{http_code}\n" https://localhost:8443/ || true'

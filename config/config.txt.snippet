@@ -2,3 +2,7 @@
 # HT-HC01P WiFi HaLow module on SPI0 — overlay carries the whole pin map.
 # Do NOT add dtparam=i2c_arm=on while the module is wired (GPIO3 = WAKE).
 dtoverlay=mm610x-spi
+# BCM2711 hardware watchdog — armed by systemd RuntimeWatchdogSec (see
+# config/watchdog-system.conf); kernel hangs reboot in <=15 s. A reboot
+# applies this line.
+dtparam=watchdog=on
