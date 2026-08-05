@@ -181,7 +181,18 @@ def api_router():
         "nft": sh("sudo /usr/sbin/nft list table ip halow 2>&1"),
         "leases": leases,
         "dnsmasq": sh("systemctl is-active dnsmasq").strip(),
+        "wifi_ap": bool(sh("nmcli -t -f NAME con show --active | grep -x mesh-2g")),
     })
+
+
+@app.post("/api/router/wifi-ap")
+@authed
+def api_router_wifi_ap():
+    state = request.form.get("state", "")
+    if state not in ("on", "off"):
+        return jsonify({"error": "state must be on or off"}), 400
+    out = sh(f"sudo /usr/local/bin/halowctl wifi-ap {state} 2>&1", timeout=30)
+    return jsonify({"state": state, "output": out})
 
 
 # ---------- Mesh nodes ----------
@@ -349,6 +360,8 @@ async function probe(btn){btn.disabled=true;btn.textContent="probing…";
  el.textContent=r.output;el.className=r.ok?"ok":"bad"}finally{btn.disabled=false;btn.textContent="Probe chip"}}
 async function setMode(m){const fd=new FormData();fd.append("mode",m);
  await fetch("/api/halow/mode",{method:"POST",body:fd});render()}
+async function wifiAp(s){const fd=new FormData();fd.append("state",s);
+ await fetch("/api/router/wifi-ap",{method:"POST",body:fd});setTimeout(render,1500)}
 async function setOvr(){const fd=new FormData();
  if($("#ch").value)fd.append("channel",$("#ch").value);
  if($("#w").value)fd.append("width",$("#w").value);
@@ -359,7 +372,9 @@ async function router(){const r=await j("/api/router");
  const ls=r.leases.length?r.leases.map(l=>
   `<tr><td>${esc(l.host)}</td><td>${esc(l.ip)}</td><td>${esc(l.mac)}</td></tr>`).join("")
   :`<tr><td colspan=3 class="warn">no leases</td></tr>`;
- return `<div class="card"><h2>interfaces — forwarding ${r.forwarding==="1"?"<span class='ok'>on</span>":"<span class='bad'>OFF</span>"} · dnsmasq ${esc(r.dnsmasq)}</h2>
+ return `<div class="card"><h2>interfaces — forwarding ${r.forwarding==="1"?"<span class='ok'>on</span>":"<span class='bad'>OFF</span>"} · dnsmasq ${esc(r.dnsmasq)}
+ · 2.4G AP mesh-2g ${r.wifi_ap?"<span class='ok'>on</span>":"<span class='warn'>off</span>"}
+ <button class="act" style="float:right" onclick="wifiAp('${r.wifi_ap?"off":"on"}')">${r.wifi_ap?"turn off":"turn on"}</button></h2>
  <table><tr><th>if</th><th>state</th><th>addrs</th></tr>${ifs}</table></div>
  <div class="card"><h2>DHCP leases (halow net)</h2>
  <table><tr><th>host</th><th>ip</th><th>mac</th></tr>${ls}</table></div>

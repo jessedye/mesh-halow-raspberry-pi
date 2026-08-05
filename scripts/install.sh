@@ -56,6 +56,18 @@ driver_build() {
 
 if [ "${1:-}" = "--driver-only" ]; then driver_build; echo "driver reinstalled for $(uname -r)"; exit 0; fi
 
+# Minutes-long restore from the repo's archived binaries (same kernel only)
+if [ "${1:-}" = "--prebuilt" ]; then
+  K=$(uname -r)
+  [ -d "$REPO_DIR/prebuilt/$K" ] || { echo "no prebuilt modules for $K — full build required"; exit 1; }
+  sudo install -D -m644 "$REPO_DIR/prebuilt/$K/morse.ko"   "/lib/modules/$K/extra/morse.ko"
+  sudo install -D -m644 "$REPO_DIR/prebuilt/$K/dot11ah.ko" "/lib/modules/$K/extra/dot11ah.ko"
+  sudo depmod -a
+  sudo tar -C /usr/local/bin -xzf "$REPO_DIR/prebuilt/s1g-bins.tar.gz"
+  echo "prebuilt modules + S1G binaries installed for $K"
+  exit 0
+fi
+
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   linux-headers-rpi-v8 build-essential git bison flex pkg-config \
