@@ -1107,10 +1107,14 @@ def api_metrics():
                      if "disk_free_mb" in s]
         if disk_vals:
             summary["disk_free_low_water_mb"] = min(disk_vals)
-        summary["uptime_pct"] = {
-            k: round(100 * sum(1 for s in samples if s.get(k)) /
-                     len(samples), 1)
-            for k in ("ap", "dnsmasq", "upstream")}
+        summary["uptime_pct"] = {}
+        for k in ("ap", "dnsmasq", "upstream", "time_synced"):
+            # denominator = samples that carry the key, so a field added
+            # mid-history doesn't read as downtime before it existed
+            have = [s for s in samples if k in s]
+            if have:
+                summary["uptime_pct"][k] = round(
+                    100 * sum(1 for s in have if s[k]) / len(have), 1)
     return jsonify({"minutes": minutes, "n": len(samples),
                     "summary": summary, "monitor": mon,
                     "samples": samples[-360:]})
@@ -1205,6 +1209,32 @@ def api_node_proxy(name, sub):
 
 # ---------- System ----------
 
+def time_sync():
+    """chrony tracking -> synced|holdover|unknown + the raw fields.
+    Raw values are always exposed beside the classification (detect the
+    event, classify separately — the operator is never hostage to our
+    classifier). ref_id 7F7F0101 = 127.127.1.1, chrony's local
+    reference = serving holdover thanks to 'local stratum 10'."""
+    out = sh("chronyc -c tracking")
+    if not out or "," not in out:
+        return {"state": "unknown"}
+    try:
+        f = out.strip().split(",")
+        ref_id, stratum, leap = f[0].upper(), int(f[2]), f[-1]
+        state = ("holdover" if ref_id == "7F7F0101"
+                 else "synced" if leap == "Normal" else "holdover")
+        ref_time = float(f[3])
+        # drilled 2026-08-05: ref_time FREEZES at holdover entry (0.0s
+        # advance over 30s wall), so an age derived from it is honest —
+        # under holdover it approximates time since the last real sync
+        return {"state": state, "stratum": stratum, "ref_id": ref_id,
+                "leap": leap, "ref_time": round(ref_time, 1),
+                "ref_age_s": max(0, int(time.time() - ref_time)),
+                "offset_ms": round(float(f[4]) * 1000, 3)}
+    except Exception:
+        return {"state": "unknown"}
+
+
 @app.get("/api/system")
 @authed
 def api_system():
@@ -1223,6 +1253,7 @@ def api_system():
         "mem": mem,
         "temp": sh("cat /sys/class/thermal/thermal_zone0/temp").strip(),
         "kernel": sh("uname -r").strip(),
+        "time_sync": time_sync(),
         "disk": {"total_mb": total_mb, "free_mb": free_mb,
                  "used_pct": round(100 * (1 - free_mb / total_mb), 1)
                  if total_mb else 0,
@@ -1514,6 +1545,7 @@ async function ovw(){const s=await j("/api/system"),h=await j("/api/halow");
  <div class="stat"><div class="v">${esc(s.mem.MemAvailable||"?")}</div><div class="k">mem avail</div></div>
  <div class="stat"><div class="v ${h.present?'ok':'bad'}">${h.present?"present":"ABSENT"}</div><div class="k">halow0</div></div>
  <div class="stat"><div class="v ${h.ap_active==='active'?'ok':'warn'}">${esc(h.ap_active)}</div><div class="k">AP service</div></div>
+ <div class="stat"><div class="v ${s.time_sync.state==='synced'?'ok':s.time_sync.state==='holdover'?'warn':'bad'}">${s.time_sync.state==='synced'?('s'+s.time_sync.stratum):s.time_sync.state==='holdover'?'HOLDOVER':'no time'}</div><div class="k">NTP</div></div>
  </div></div>
  <div class="card"><h2>kernel / disk</h2><pre>${esc(s.kernel)}  root <span class="${s.disk.low?'bad':'ok'}">${s.disk.free_mb} MB free</span> of ${s.disk.total_mb} MB (${s.disk.used_pct}% used)${s.disk.low?' — BELOW '+s.disk.low_water_mb+' MB LOW-WATER':''}</pre></div>
  ${await monCard()}`}

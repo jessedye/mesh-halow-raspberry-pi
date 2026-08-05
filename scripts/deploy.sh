@@ -21,7 +21,7 @@ echo "== sync repo"
 rsync -a --delete --exclude .git --exclude secrets.env "$REPO/" "$PI:mesh-halow-raspberry-pi/"
 
 echo "== packages"
-ssh "$PI" 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq python3-flask isc-dhcp-client iperf3 conntrack bind9-dnsutils chrony avahi-daemon tcpdump iputils-arping >/dev/null 2>&1; true'
+ssh "$PI" 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq python3-flask isc-dhcp-client iperf3 conntrack bind9-dnsutils chrony avahi-daemon tcpdump iputils-arping fake-hwclock >/dev/null 2>&1; true'
 
 echo "== /etc/halow"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT; umask 077
@@ -60,6 +60,8 @@ rm -rf /tmp/halow-deploy
 sudo install -m644 config/halow-profiles.json config/pinned-scan.json config/nftables-halow.conf /etc/halow/
 sudo install -m644 config/dnsmasq-halow.conf /etc/dnsmasq.d/halow.conf
 sudo install -m644 config/chrony-halow.conf /etc/chrony/conf.d/halow.conf
+sudo systemctl restart chrony || true
+sudo systemctl enable --now fake-hwclock >/dev/null 2>&1 || true
 sudo install -m644 config/logrotate-halow /etc/logrotate.d/halow
 sudo mkdir -p /etc/systemd/journald.conf.d
 sudo install -m644 config/journald-halow.conf /etc/systemd/journald.conf.d/halow.conf

@@ -211,7 +211,20 @@ nothing on the v1 rejected list); verifier corrections are folded in.
 
 ### Tier 2 — unattended reliability (16 and 17 here are live defects)
 
-21. **Time holdover DEFECT** — chrony-halow.conf is two allow lines; with
+21. **Time holdover DEFECT** — DONE 2026-08-05 (defect reproduced [M]:
+    chrony restarted with NTP egress blocked = stratum 0, client query
+    "Timeout reached"; with `local stratum 10` the same drill serves an
+    accepted stratum-10 answer in ~10s. All four T3 transitions observed
+    receiver-side; ref_time FREEZES at holdover entry [M] so ref_age_s
+    is honest and shipped; epoch drill: 2-day offset corrected by a
+    STEP (172800s) not a slew — default makestep 1 3 suffices; chrony
+    stopped -> API 200 state:unknown; controlled holdover sample ->
+    time_synced false in metrics [M]. Findings: fake-hwclock was NOT
+    installed on this image (now installed + enabled via deploy);
+    Trixie splits it into -load/-save units and masks the legacy name —
+    verify.sh tests fake-hwclock-load. verify.sh 13/13. Node-side flag:
+    Meshtastic ignores DHCP option 42 — node network.ntp_server must be
+    set to 10.117.0.1 for T8/T9.) — chrony-halow.conf is two allow lines; with
     no `local` directive chrony refuses to serve when the gateway is
     unsynced (field power-cycle with upstream down = nodes get no time,
     skip GPS-log pruning, fill flash). Add `local stratum 10`, verify

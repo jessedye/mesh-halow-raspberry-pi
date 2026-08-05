@@ -76,3 +76,21 @@ Three layers must agree:
   Co-siting hazard: a keyed LoRa transmit puts ~+18 dBm into a co-sited
   HaLow front end at 0.1 m. The Pi gateway is not co-sited with the nodes'
   LoRa antennas, but the *nodes* are — mesh-v4 issue #119.
+
+## Time
+
+chrony serves the HaLow/mesh-2g subnets (`config/chrony-halow.conf`) with
+`local stratum 10` holdover: an unsynchronized gateway (field power-cycle
+with the upstream down) still serves its own clock — drilled 2026-08-05,
+unfixed config refused clients ("Timeout reached"), fixed config answers
+at stratum 10 within ~10s. Holdover is approximately right thanks to the
+Debian driftfile + fake-hwclock (NOT on the stock Trixie image — deploy.sh
+installs it; Trixie ships it as fake-hwclock-load/-save units with the
+legacy unit masked). `/api/system` carries `time_sync` (synced/holdover/
+unknown + raw stratum/ref_id/ref_age_s); metrics history tracks
+`time_synced` per minute.
+
+Coordination flag for mesh-v4: Meshtastic ignores DHCP option 42
+(WiFiAPClient.cpp uses `config.network.ntp_server`) — the nodes must set
+`network.ntp_server = 10.117.0.1` or they will chase the default pool
+through NAT, which dies exactly when the upstream does.

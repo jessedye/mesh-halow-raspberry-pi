@@ -28,6 +28,13 @@ chk "wlan interface exists" sh -c 'iw dev | grep -A1 "phy" | grep Interface'
 chk "morse_cli answers (fw version)" sh -c 'sudo morse_cli -i halow0 version 2>/dev/null | grep "FW Version"'
 chk "AP enabled (mesh beaconing)" sh -c 'iw dev halow0 info | grep -E "ssid|type AP"'
 chk "2.4GHz AP (mesh-2g)" sh -c 'nmcli -t -f NAME,STATE con show --active | grep mesh-2g'
+# chronyd -p prints the EFFECTIVE merged config — guards the conf.d
+# ordering gotcha and future base-file drift, not just our drop-in text.
+chk "chrony local holdover directive effective" sh -c 'sudo chronyd -p 2>/dev/null | grep -E "^local"'
+# Trixie splits fake-hwclock into -load/-save units and MASKS the legacy
+# monolithic unit — test the load unit, fall back to the old name.
+chk "fake-hwclock enabled" sh -c 'systemctl is-enabled fake-hwclock-load.service 2>/dev/null | grep -E "enabled|static" || systemctl is-enabled fake-hwclock 2>/dev/null | grep -E "^enabled|^static"'
+chk "chronyc answers (tracking)" sh -c 'chronyc -c tracking | head -1'
 echo
 journalctl -k -q --no-pager -g "morse" -n 10
 exit $fail

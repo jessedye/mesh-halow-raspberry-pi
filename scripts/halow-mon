@@ -460,6 +460,12 @@ def main():
     thr = sh("vcgencmd get_throttled")
     vfs = os.statvfs("/")
     free_mb = vfs.f_bavail * vfs.f_frsize // 1048576
+    # time sync: mirrored parse of ui time_sync() — synced means a real
+    # reference (not chrony's 7F7F0101 local holdover) with leap Normal
+    tr = sh("chronyc -c tracking")
+    trf = tr.strip().split(",") if tr and "," in tr else []
+    time_synced = bool(trf) and trf[0].upper() != "7F7F0101" \
+        and trf[-1] == "Normal"
     sample = {
         "t": now,
         "load1": float(open("/proc/loadavg").read().split()[0]),
@@ -471,6 +477,7 @@ def main():
         "stations": len(parsed),
         "sta_reachable": sta_reachable,
         "disk_free_mb": free_mb,
+        "time_synced": time_synced,
         "ap": ap_beaconing, "dnsmasq": dnsmasq_ok, "upstream": upstream_ok,
     }
     # disk low-water: edge-triggered — one logged event per crossing,
