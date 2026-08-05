@@ -302,7 +302,15 @@ nothing on the v1 rejected list); verifier corrections are folded in.
     no fourth parallel inventory, nothing cryptographic (PKI nodedb stays
     rejected). One-click onboarding proposes reservation + nodes.json
     entry when an unknown MAC associates. [medium/high]
-26. **Node-proxy failover + reach matrix** — proxy knows only static LAN
+26. **Node-proxy failover + reach matrix** — DONE 2026-08-05 (two-leg
+    node_get: LAN url then live HaLow lease by MAC, 5s/leg; vip.py
+    damping drilled [M] — black-holed LAN -> per-leg 502s, demote after
+    2, promote after 3 on restore; X-Node-Path/Via headers. /api/reach:
+    ICMP + HEAD per family (plain-HTTP first, never bare connects),
+    route guards — both nodes' device-stated LoRa/VIP harvested from
+    live /api/ip passes and honestly no-route; 0.7s matrix, 20s
+    budget/cache. Zero new privilege. HaLow-leg traversal awaits a
+    leased station.) — proxy knows only static LAN
     URLs, so the Nodes tab goes blind exactly when HaLow is being the
     last-reaching rung. On LAN failure resolve the node's current
     10.117.0.x from leases by MAC (same mac field as 25 — implement
