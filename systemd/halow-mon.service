@@ -1,0 +1,6 @@
+[Unit]
+Description=HaLow gateway metrics sampler and self-healing monitor
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/halow-mon

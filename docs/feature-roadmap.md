@@ -34,7 +34,7 @@ UI/API, recovery — but the clients set a higher bar in three areas:
    AP-STA-CONNECTED/DISCONNECTED with timestamps; `GET /api/halow/events`;
    UI surfaces joins/leaves. The first real node join should
    self-document the way first contact did.
-4. **Gateway metrics with history** — nodes expose `/api/metrics` with
+4. **Gateway metrics with history** — DONE 2026-08-05 (halow-mon timer: 1/min ring, /api/metrics with low-water marks + uptime%, Overview card). — nodes expose `/api/metrics` with
    reboot reasons and low-water marks. Pi equivalent: ring of CPU, temp,
    mem, **`vcgencmd get_throttled` undervoltage flags** (this bench has
    brownout history and the module TX-bursts on the 3V3 rail), station
@@ -46,7 +46,7 @@ UI/API, recovery — but the clients set a higher bar in three areas:
 6. **Kernel/module mismatch guard (A6)** — boot-time check comparing
    `uname -r` against the built module; UI warning banner + halowctl
    warning. Pair with an `install.sh --driver-only` hint.
-7. **Self-healing health monitor** — timer that verifies the AP is
+7. **Self-healing health monitor** — DONE 2026-08-05 (same daemon: AP-beaconing + dnsmasq + upstream ICMP checks, bounded restarts with counters; heal path live-tested). — timer that verifies the AP is
    *beaconing* (iw), DHCP answering, and the upstream gateway reachable
    (ping 192.168.50.1 — test reachability, not driver state: the bench's
    "alive, associated, and unreachable" lesson), with bounded restarts

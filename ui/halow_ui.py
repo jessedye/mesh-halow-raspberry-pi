@@ -653,6 +653,47 @@ def api_diag_chip():
     return jsonify({"ok": ok, "output": out})
 
 
+@app.get("/api/metrics")
+@authed
+def api_metrics():
+    minutes = min(int(request.args.get("minutes", "60")), 2880)
+    samples = []
+    try:
+        import time as _t
+        cutoff = _t.time() - minutes * 60
+        with open("/var/lib/halow/metrics.jsonl") as f:
+            for line in f:
+                try:
+                    s = json.loads(line)
+                    if s["t"] >= cutoff:
+                        samples.append(s)
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    mon = {}
+    try:
+        mon = json.load(open("/var/lib/halow/mon-state.json"))
+    except Exception:
+        pass
+    summary = {}
+    if samples:
+        for k in ("temp_c", "load1", "mem_avail_kb", "stations"):
+            vals = [s[k] for s in samples if k in s]
+            summary[k] = {"min": min(vals), "max": max(vals),
+                          "now": vals[-1]}
+        # low-water mark is the value that means something (bench lesson)
+        summary["mem_low_water_kb"] = min(
+            s["mem_avail_kb"] for s in samples)
+        summary["uptime_pct"] = {
+            k: round(100 * sum(1 for s in samples if s.get(k)) /
+                     len(samples), 1)
+            for k in ("ap", "dnsmasq", "upstream")}
+    return jsonify({"minutes": minutes, "n": len(samples),
+                    "summary": summary, "monitor": mon,
+                    "samples": samples[-360:]})
+
+
 @app.get("/api/diag")
 @authed
 def api_diag_bundle():
@@ -985,7 +1026,21 @@ async function ovw(){const s=await j("/api/system"),h=await j("/api/halow");
  <div class="stat"><div class="v ${h.present?'ok':'bad'}">${h.present?"present":"ABSENT"}</div><div class="k">halow0</div></div>
  <div class="stat"><div class="v ${h.ap_active==='active'?'ok':'warn'}">${esc(h.ap_active)}</div><div class="k">AP service</div></div>
  </div></div>
- <div class="card"><h2>kernel / disk</h2><pre>${esc(s.kernel)}  root ${esc((s.disk[3]||"?"))} free</pre></div>`}
+ <div class="card"><h2>kernel / disk</h2><pre>${esc(s.kernel)}  root ${esc((s.disk[3]||"?"))} free</pre></div>
+ ${await monCard()}`}
+async function monCard(){try{const m=await j("/api/metrics?minutes=1440");
+ if(!m.n)return `<div class="card"><h2>monitor (24h)</h2><p class="warn">no samples yet</p></div>`;
+ const s=m.summary,mo=m.monitor;
+ return `<div class="card"><h2>monitor — last 24h (${m.n} samples)</h2>
+ <div class="grid">
+ <div class="stat"><div class="v">${s.temp_c.now}°C</div><div class="k">temp (${s.temp_c.min}–${s.temp_c.max})</div></div>
+ <div class="stat"><div class="v">${Math.round(s.mem_low_water_kb/1024)} MB</div><div class="k">mem low-water</div></div>
+ <div class="stat"><div class="v">${s.uptime_pct.ap}%</div><div class="k">AP beaconing</div></div>
+ <div class="stat"><div class="v">${s.uptime_pct.upstream}%</div><div class="k">upstream reachable</div></div>
+ <div class="stat"><div class="v">${(mo.ap_restarts||0)+(mo.dnsmasq_restarts||0)+(mo.eth0_bounces||0)}</div><div class="k">heal actions (ap ${mo.ap_restarts||0} / dns ${mo.dnsmasq_restarts||0} / eth0 ${mo.eth0_bounces||0})</div></div>
+ <div class="stat"><div class="v">${s.stations.now}</div><div class="k">stations (max ${s.stations.max})</div></div>
+ </div>${(mo.actions&&mo.actions.length)?`<pre>${esc(mo.actions.slice(-5).map(a=>a.at+" "+a.action).join("\n"))}</pre>`:""}</div>`}
+ catch(e){return `<div class="card"><h2>monitor</h2><p class="bad">${esc(e)}</p></div>`}}
 async function halow(){const h=await j("/api/halow");
  const profs=Object.entries(h.profiles).map(([n,p])=>
   `<tr><td>${n===h.profile?"▶":""}</td><td>${esc(n)}</td><td>${p.width_mhz} MHz</td>

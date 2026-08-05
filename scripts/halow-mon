@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Gateway metrics sampler + self-healing monitor. Runs as root once a
+minute via halow-mon.timer.
+
+Samples into /var/lib/halow/metrics.jsonl (2-day ring) and heals with
+bounded actions, counting every intervention in mon-state.json — detect
+the event, classify separately, and never hide how often healing fired.
+Reachability is tested with ICMP to the upstream gateway, not by asking
+the driver how it feels (the bench's dead-association lesson)."""
+import json
+import os
+import subprocess
+import time
+
+STATE_DIR = "/var/lib/halow"
+METRICS = os.path.join(STATE_DIR, "metrics.jsonl")
+STATE = os.path.join(STATE_DIR, "mon-state.json")
+RING_LINES = 2880  # 2 days at 1/min
+UPSTREAM = "192.168.50.1"
+
+
+def sh(cmd, timeout=15):
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True,
+                              text=True, timeout=timeout).stdout.strip()
+    except Exception:
+        return ""
+
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return {"ap_restarts": 0, "dnsmasq_restarts": 0, "eth0_bounces": 0,
+                "ap_down_streak": 0, "upstream_down_streak": 0,
+                "last_eth0_bounce": 0, "actions": []}
+
+
+def act(state, key, note):
+    state[key] += 1
+    state["actions"] = (state["actions"] + [
+        {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "action": note}])[-20:]
+    subprocess.run(["logger", "-t", "halow-mon", note])
+
+
+def main():
+    st = load_state()
+    now = int(time.time())
+
+    halow_present = os.path.isdir("/sys/class/net/halow0")
+    ap_beaconing = "type AP" in sh("iw dev halow0 info")
+    ap_wanted = halow_present and \
+        sh("systemctl is-enabled halow-ap") in ("enabled", "static")
+    dnsmasq_ok = sh("systemctl is-active dnsmasq") == "active"
+    upstream_ok = subprocess.run(
+        ["ping", "-c", "1", "-W", "2", "-n", UPSTREAM],
+        capture_output=True).returncode == 0
+
+    # --- heal, bounded ---
+    if ap_wanted and not ap_beaconing:
+        st["ap_down_streak"] += 1
+        if st["ap_down_streak"] >= 2:  # two consecutive minutes, not a blip
+            act(st, "ap_restarts", "AP not beaconing 2 samples - restarting halow-ap")
+            subprocess.run(["systemctl", "restart", "halow-ap"])
+            st["ap_down_streak"] = 0
+    else:
+        st["ap_down_streak"] = 0
+
+    if not dnsmasq_ok:
+        act(st, "dnsmasq_restarts", "dnsmasq inactive - restarting")
+        subprocess.run(["systemctl", "restart", "dnsmasq"])
+
+    if not upstream_ok:
+        st["upstream_down_streak"] += 1
+        if (st["upstream_down_streak"] >= 5
+                and now - st["last_eth0_bounce"] > 1800):
+            act(st, "eth0_bounces",
+                "upstream unreachable 5 samples - bouncing eth0-static")
+            subprocess.run(["nmcli", "con", "up", "eth0-static"],
+                           capture_output=True)
+            st["last_eth0_bounce"] = now
+            st["upstream_down_streak"] = 0
+    else:
+        st["upstream_down_streak"] = 0
+
+    # --- sample ---
+    thr = sh("vcgencmd get_throttled")
+    sample = {
+        "t": now,
+        "load1": float(open("/proc/loadavg").read().split()[0]),
+        "temp_c": round(int(open(
+            "/sys/class/thermal/thermal_zone0/temp").read()) / 1000, 1),
+        "mem_avail_kb": next(int(x.split()[1]) for x in
+                             open("/proc/meminfo") if "MemAvailable" in x),
+        "throttled": thr.split("=")[-1] if "=" in thr else None,
+        "stations": sh("iw dev halow0 station dump").count("Station"),
+        "ap": ap_beaconing, "dnsmasq": dnsmasq_ok, "upstream": upstream_ok,
+    }
+    with open(METRICS, "a") as f:
+        f.write(json.dumps(sample) + "\n")
+
+    # ring prune (cheap: only when oversized)
+    try:
+        lines = open(METRICS).readlines()
+        if len(lines) > RING_LINES + 200:
+            open(METRICS, "w").writelines(lines[-RING_LINES:])
+    except OSError:
+        pass
+    os.chmod(METRICS, 0o644)
+
+    json.dump(st, open(STATE, "w"))
+    os.chmod(STATE, 0o644)
+
+
+if __name__ == "__main__":
+    main()
