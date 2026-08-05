@@ -14,6 +14,7 @@ giving the mesh-v4 transport ladder its HaLow rung.
 |---|---|
 | `docs/wiring.md` | Debug-board header ↔ Pi pin map, SPI timing, fault history |
 | `docs/software-stack.md` | Pinned versions, why each, caveats, regulatory |
+| `docs/feature-roadmap.md` | Audit vs the mesh-v4 clients; needed and recommended features |
 | `overlays/mm610x-spi-overlay.dts` | Device-tree overlay for the SPI wiring |
 | `config/morse.conf` | `/etc/modprobe.d` options (BCF + `country=US`) |
 | `config/config.txt.snippet` | Boot config line |
