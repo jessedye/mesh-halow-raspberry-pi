@@ -60,8 +60,8 @@ if [ "${1:-}" = "--driver-only" ]; then driver_build; echo "driver reinstalled f
 if [ "${1:-}" = "--prebuilt" ]; then
   K=$(uname -r)
   [ -d "$REPO_DIR/prebuilt/$K" ] || { echo "no prebuilt modules for $K — full build required"; exit 1; }
-  sudo install -D -m644 "$REPO_DIR/prebuilt/$K/morse.ko"   "/lib/modules/$K/extra/morse.ko"
-  sudo install -D -m644 "$REPO_DIR/prebuilt/$K/dot11ah.ko" "/lib/modules/$K/extra/dot11ah.ko"
+  sudo install -D -m644 "$REPO_DIR/prebuilt/$K/morse.ko"   "/lib/modules/$K/updates/morse.ko"
+  sudo install -D -m644 "$REPO_DIR/prebuilt/$K/dot11ah.ko" "/lib/modules/$K/updates/dot11ah.ko"
   sudo depmod -a
   sudo tar -C /usr/local/bin -xzf "$REPO_DIR/prebuilt/s1g-bins.tar.gz"
   echo "prebuilt modules + S1G binaries installed for $K"

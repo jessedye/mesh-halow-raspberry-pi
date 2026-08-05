@@ -270,7 +270,7 @@ for r in json.load(open("/etc/halow/forwards.json")):
   stop) sudo systemctl stop halow-ap ;;
   status)
     K=$(uname -r)
-    [ -f "/lib/modules/$K/extra/morse.ko" ] || \
+    ls "/lib/modules/$K/updates/morse.ko"* "/lib/modules/$K/extra/morse.ko"* >/dev/null 2>&1 || \
       echo "!! NO morse.ko FOR RUNNING KERNEL $K — a kernel upgrade orphaned the driver; run install.sh --driver-only (or --prebuilt) BEFORE the next reboot"
     echo "== interface"; ip -br addr show "${HALOW_IF:-halow0}" 2>/dev/null || echo "  ${HALOW_IF:-halow0}: ABSENT (driver not probed?)"
     echo "== AP service"; systemctl is-active halow-ap 2>/dev/null || true
