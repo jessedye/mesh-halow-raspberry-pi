@@ -566,7 +566,8 @@ def api_system_reboot():
 THROUGHPUT_LOG = "/var/lib/halow/throughput.jsonl"
 EVENTS_LOG = "/var/lib/halow/station-events.log"
 LOG_UNITS = ("halow-ap", "halow-net", "halow-ui", "halow-sta-events",
-             "halow-iperf3", "dnsmasq", "kernel")
+             "halow-join-watch", "halow-iperf3", "dnsmasq", "kernel")
+JOIN_STATE_DIR = "/var/lib/halow/join"
 
 
 @app.post("/api/halow/throughput")
@@ -624,6 +625,65 @@ def api_halow_events():
     except OSError:
         pass
     return jsonify({"events": lines})
+
+
+def _valid_mac(mac):
+    import re as _re
+    return bool(_re.fullmatch(r"([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", mac))
+
+
+@app.get("/api/halow/join-log")
+@authed
+def api_join_log():
+    """Association-forensics summary: every MAC seen, verdict + last stage.
+    Fresh bounded parse (wall-clock verdicts — state.json's precomputed
+    verdicts only refresh when journal lines arrive, so silence would
+    read as in_progress forever). Falls back to the watcher's state file.
+    Empty history is 200, not an error."""
+    hours = min(int(request.args.get("hours", "24")), 48)
+    try:
+        r = subprocess.run(["/usr/local/bin/halow-join-log", "--all",
+                            "--since-hours", str(hours)],
+                           capture_output=True, text=True, timeout=15)
+        return Response(r.stdout, mimetype="application/json")
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(JOIN_STATE_DIR, "state.json")) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return jsonify({"stations": {}})
+    return jsonify({"stations": st.get("verdicts", {})})
+
+
+@app.get("/api/halow/join-log/<mac>")
+@authed
+def api_join_log_mac(mac):
+    if not _valid_mac(mac):
+        return jsonify({"error": "bad mac"}), 400
+    hours = min(int(request.args.get("hours", "24")), 48)
+    try:
+        r = subprocess.run(["/usr/local/bin/halow-join-log", mac.lower(),
+                            "--since-hours", str(hours)],
+                           capture_output=True, text=True, timeout=15)
+        d = json.loads(r.stdout)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    d["bundle"] = f"/api/halow/join-log/{mac.lower()}/bundle"
+    return jsonify(d)
+
+
+@app.get("/api/halow/join-log/<mac>/bundle")
+@authed
+def api_join_log_bundle(mac):
+    if not _valid_mac(mac):
+        return jsonify({"error": "bad mac"}), 400
+    path = os.path.join(JOIN_STATE_DIR,
+                        mac.lower().replace(":", "-") + "-first-sight.log")
+    try:
+        return Response(open(path).read(), mimetype="text/plain")
+    except OSError:
+        return jsonify({"error": "no bundle for that mac yet"}), 404
 
 
 @app.get("/api/logs")
@@ -887,7 +947,7 @@ def api_diag_bundle():
     """One-shot bundle — the gateway's answer to the nodes' /api/diag."""
     services = {}
     for u in ("halow-ap", "halow-net", "halow-ui", "dnsmasq",
-              "halow-iperf3", "halow-sta-events"):
+              "halow-iperf3", "halow-sta-events", "halow-join-watch"):
         services[u] = {
             "active": sh(f"systemctl is-active {u}").strip(),
             "restarts": sh(f"systemctl show -p NRestarts --value {u}").strip(),
@@ -1098,7 +1158,8 @@ async function diag(){const nb=await j("/api/diag/neigh"),sv=await j("/api/diag/
  <button class="act" onclick="dDns(this)">resolve</button></p><pre id="d-out"></pre></div>
  <div class="card"><h2>neighbors (ARP/NDP)</h2>
  <table><tr><th>ip</th><th>dev</th><th>mac</th><th>state</th></tr>${neigh}</table>
- <p style="color:var(--dim)">FAILED with a known mac = the "associated but answers no ARP" trap.</p></div>
+ <p style="color:var(--dim)">FAILED with a known mac = the "associated but answers no ARP" trap —
+ now auto-detected as <code>dhcp_no_reach</code> in the Debug tab's join forensics.</p></div>
  <div class="card"><h2>power / throttling</h2>
  <p>${pw.temp_c}°C · ${esc(pw.volts_core||"")} · ${pw.flags.map(f=>
   `<span class="${f.includes("NOW")?"bad":(f.includes("occurred")?"warn":"ok")}">${esc(f)}</span>`).join(" · ")}</p></div>
@@ -1135,10 +1196,23 @@ async function dDns(b){b.disabled=true;try{const fd=new FormData();
 async function dLoad(url,label,fmt){const d=await j(url);
  $("#m-out").textContent=`== ${label}\n`+fmt(d)}
 async function debug(){const ev=await j("/api/halow/events"),tp=await j("/api/halow/throughput");
+ let jl={stations:{}};try{jl=await j("/api/halow/join-log")}catch(e){}
+ const jrows=Object.entries(jl.stations).map(([m,s])=>
+  `<tr><td><a href="#" onclick="joinDetail('${m}');return false">${esc(m)}</a></td>
+   <td>${s.attempts||0}</td><td>${esc(s.last_stage||"—")}</td>
+   <td class="${s.verdict==='complete'?'ok':(s.verdict==='in_progress'||s.verdict==='probe_pending')?'warn':'bad'}">${esc(s.verdict||"")}</td>
+   <td>${esc(s.last_stage_at||"")}</td></tr>`).join("")
+  ||`<tr><td colspan=5 class="warn">no join attempts witnessed</td></tr>`;
  const runs=tp.runs.length?tp.runs.slice(-10).reverse().map(r=>
   `<tr><td>${esc(r.at)}</td><td>${esc(r.target)}</td><td>${r.reverse?"AP→STA":"STA→AP"}</td><td>${r.mbps} Mbps</td></tr>`).join("")
   :`<tr><td colspan=4 class="warn">no runs recorded</td></tr>`;
- return `<div class="card"><h2>throughput test (iperf3)</h2>
+ return `<div class="card"><h2>join forensics</h2>
+ <table><tr><th>mac</th><th>attempts</th><th>last stage</th><th>verdict</th><th>at</th></tr>${jrows}</table>
+ <p style="color:var(--dim)">Verdicts: silence_after_commit = RF died mid-handshake ·
+ sae_confirm_failed = wrong PSK · dhcp_no_reach = the "associated but answers no ARP"
+ trap, auto-detected. Per-MAC bundle: first-sight evidence snapshot.</p>
+ <pre id="jl-out" style="max-height:400px"></pre></div>
+ <div class="card"><h2>throughput test (iperf3)</h2>
  <p>target IP <input id="t-ip" placeholder="10.117.0.50">
  seconds <input id="t-sec" value="5" style="width:50px">
  <label><input type="checkbox" id="t-rev" style="width:auto"> AP→STA (reverse)</label>
@@ -1148,7 +1222,7 @@ async function debug(){const ev=await j("/api/halow/events"),tp=await j("/api/ha
  <div class="card"><h2>station events</h2>
  <pre>${esc(ev.events.slice(-25).join("\n")||"none recorded")}</pre></div>
  <div class="card"><h2>service logs</h2>
- <p><select id="l-unit">${["halow-ap","halow-net","halow-ui","halow-sta-events","halow-iperf3","dnsmasq","kernel"].map(u=>`<option>${u}</option>`).join("")}</select>
+ <p><select id="l-unit">${["halow-ap","halow-net","halow-ui","halow-sta-events","halow-join-watch","halow-iperf3","dnsmasq","kernel"].map(u=>`<option>${u}</option>`).join("")}</select>
  <button class="act" onclick="logsLoad()">load</button></p>
  <pre id="l-out" style="max-height:400px"></pre></div>`}
 async function tpRun(btn){btn.disabled=true;btn.textContent="running…";
@@ -1159,6 +1233,8 @@ async function tpRun(btn){btn.disabled=true;btn.textContent="running…";
 async function logsLoad(){const u=$("#l-unit").value;
  const d=await j(`/api/logs?unit=${u}&n=200`);
  $("#l-out").textContent=d.lines.join("\n")||"(empty)"}
+async function joinDetail(m){const d=await j("/api/halow/join-log/"+m);
+ $("#jl-out").textContent=JSON.stringify(d,null,1)}
 async function config(){const c=await j("/api/config");
  const fwds=c.forwards.length?c.forwards.map(f=>
   `<tr><td>${esc(f.proto)}</td><td>${f.ext}</td><td>${esc(f.dest)}</td>

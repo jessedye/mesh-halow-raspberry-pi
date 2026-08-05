@@ -117,6 +117,7 @@ mesh-v4 token; only its sha256 is stored on the gateway).
 | `POST /api/system/reboot` | `confirm=1` |
 | `POST /api/halow/profile` | `name` (long-range/mid-range/balanced/max-rate); `confirm=1` to override the pinned-scan guard |
 | `GET /api/halow/compat` | — (pinned-set verdicts; optional `profile`/`channel`/`width`/`ssid` candidate) |
+| `GET /api/halow/join-log[/<mac>[/bundle]]` | — (association forensics: per-MAC stage transcript + verdict; `hours=` ≤48) |
 | `POST /api/halow/probe` | — |
 
 **Pinned-scan guard**: the ESP32 nodes scan only five (frequency, width)

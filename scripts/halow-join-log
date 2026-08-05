@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""halow-join-log — per-MAC HaLow association forensics (roadmap 16).
+
+A join can die at five distinct stages (SAE commit/confirm, assoc, 4-way
+EAPOL, DHCP, first ARP/ICMP) and the node side is mute exactly when it
+matters (RF bring-up wedges its SPI slave; halow_psk is write-only in node
+NVS). This parses the hostapd_s1g + dnsmasq journals into a per-MAC stage
+machine and names the last stage reached — wrong-PSK vs RF-died-mid-
+handshake is answerable from the gateway alone.
+
+Modes:
+  halow-join-log --all [--since-hours N]   summary JSON, every MAC in window
+  halow-join-log <mac> [--since-hours N]   full transcript + stages + verdict
+  halow-join-log --follow                  daemon (halow-join-watch.service)
+  halow-join-log --parse-file PATH         parse a journalctl -o short-iso dump
+  halow-join-log --selftest                embedded fixtures; exit 0 iff green
+
+Runs entirely unprivileged (journal via systemd-journal group, iw/ip/ping
+need no root). State: /var/lib/halow/join/ — atomic writes (tmp+replace)
+from day one; this component's job is surviving the failures it records.
+
+Marker strings are [C] from upstream hostapd 2.10 lineage until the bench
+re-captures them verbatim (acceptance runs 7-9); unmatched lines become
+raw events, never crashes, and MARKERS below is the one place to fix.
+Issue #28 extends the same table with deauth reason codes.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+
+STATE_DIR = "/var/lib/halow/join"
+MAX_MACS = 64
+MAX_EVENTS = 500          # per-MAC transcript ring
+TRIM_AT = 800             # rewrite transcript when it grows past this
+MAX_BUNDLE = 32 * 1024
+MAX_LINES = 5000          # on-demand journal parse cap
+MAX_HOURS = 48
+SILENCE_S = 30            # stage machine stall timeout
+PROBE_DELAY_S = 5
+MAC_RE = re.compile(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})")
+IP_RE = re.compile(r"(10\.117\.0\.\d{1,3})")
+CONFIRM_STATUS_RE = re.compile(r"RX confirm[^)]*status[= ](\d+)")
+
+# stage -> (source-tag, marker substring). Order = ladder order.
+# One dict on purpose: bench corrections and #28's deauth rows are
+# one-line diffs here, nowhere else.
+MARKERS = [
+    ("sae_commit",    "halow-ap", "start SAE authentication (RX commit"),
+    ("sae_confirm",   "halow-ap", "SAE authentication (RX confirm"),
+    ("authenticated", "halow-ap", "IEEE 802.11: authenticated"),
+    ("associated",    "halow-ap", "IEEE 802.11: associated"),
+    ("eapol_done",    "halow-ap", "pairwise key handshake completed"),
+    ("eapol_done",    "halow-ap", "AP-STA-CONNECTED"),
+    ("psk_mismatch",  "halow-ap", "AP-STA-POSSIBLE-PSK-MISMATCH"),
+    ("dhcp_discover", "dnsmasq",  "DHCPDISCOVER(halow0)"),
+    ("dhcp_offer",    "dnsmasq",  "DHCPOFFER(halow0)"),
+    ("dhcp_request",  "dnsmasq",  "DHCPREQUEST(halow0)"),
+    ("dhcp_ack",      "dnsmasq",  "DHCPACK(halow0)"),
+]
+STAGE_ORDER = ["sae_commit", "sae_confirm", "authenticated", "associated",
+               "eapol_done", "dhcp_discover", "dhcp_offer", "dhcp_request",
+               "dhcp_ack", "reachable"]
+
+
+def parse_ts(tok):
+    try:
+        return datetime.fromisoformat(tok).timestamp()
+    except ValueError:
+        return None
+
+
+def mac_file(mac):
+    return mac.replace(":", "-")
+
+
+def atomic_write(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+class JoinState:
+    """Per-MAC stage machine + verdict engine. Pure logic; I/O lives in
+    the callers so --parse-file/--selftest run without touching disk."""
+
+    def __init__(self):
+        self.macs = {}   # mac -> record
+        self.now = 0.0   # advanced by every parsed line; callers may override
+
+    def record(self, mac):
+        if mac not in self.macs:
+            self.macs[mac] = {"first_seen": None, "attempts": 0,
+                              "stages": {}, "events": [], "ip": None,
+                              "confirm_status": None, "psk_mismatch": False,
+                              "probe": None, "bundle": False}
+            self.evict()
+        return self.macs[mac]
+
+    def evict(self):
+        while len(self.macs) > MAX_MACS:
+            oldest = min(self.macs, key=lambda m:
+                         self.macs[m]["first_seen"] or 0)
+            del self.macs[oldest]
+
+    def feed(self, line):
+        """Parse one journalctl -o short-iso line. Returns (mac, stage) if
+        a stage advanced, (mac, None) for a raw event, None otherwise."""
+        parts = line.split(None, 1)
+        if not parts:
+            return None
+        ts = parse_ts(parts[0])
+        if ts is None:
+            return None   # not a journal line; ignore, never crash
+        self.now = max(self.now, ts)
+        rest = parts[1] if len(parts) > 1 else ""
+        m = MAC_RE.search(rest)
+        if not m:
+            return None
+        mac = m.group(1).lower()
+        src = "dnsmasq" if "dnsmasq" in rest.split(":", 1)[0] else "halow-ap"
+        stage = None
+        for st, tag, marker in MARKERS:
+            if tag == src and marker in rest:
+                stage = st
+                break
+        rec = self.record(mac)
+        if rec["first_seen"] is None:
+            rec["first_seen"] = ts
+        ev = {"t": parts[0], "src": src, "stage": stage,
+              "line": rest[-300:]}
+        rec["events"].append(ev)
+        del rec["events"][:-MAX_EVENTS]
+        if stage is None:
+            return (mac, None)
+        if stage == "sae_commit":
+            rec["attempts"] += 1
+        if stage == "sae_confirm":
+            sm = CONFIRM_STATUS_RE.search(rest)
+            if sm:
+                rec["confirm_status"] = int(sm.group(1))
+        if stage == "psk_mismatch":
+            rec["psk_mismatch"] = True
+            return (mac, stage)
+        if stage == "dhcp_ack":
+            ipm = IP_RE.search(rest)
+            if ipm:
+                rec["ip"] = ipm.group(1)
+        rec["stages"][stage] = {"t": parts[0], "ts": ts}
+        return (mac, stage)
+
+    def set_probe(self, mac, sent, received, neigh):
+        rec = self.record(mac)
+        rec["probe"] = {"sent": sent, "received": received, "neigh": neigh,
+                        "counted_at": "receiver"}
+        if received == sent and sent > 0:
+            rec["stages"]["reachable"] = {
+                "t": datetime.now(timezone.utc).astimezone().isoformat(
+                    timespec="seconds"), "ts": time.time()}
+
+    def last_stage(self, mac):
+        rec = self.macs.get(mac)
+        if not rec:
+            return None, None
+        best_i, best = -1, None
+        for st, info in rec["stages"].items():
+            i = STAGE_ORDER.index(st)
+            if i > best_i:
+                best_i, best = i, (st, info)
+        return best if best else (None, None)
+
+    def verdict(self, mac, now=None):
+        now = self.now if now is None else now
+        rec = self.macs.get(mac)
+        if not rec or not rec["stages"]:
+            return "never_seen"
+        if rec["psk_mismatch"] or (rec["confirm_status"] not in (None, 0)):
+            return "sae_confirm_failed"
+        st, info = self.last_stage(mac)
+        if st == "reachable":
+            return "complete"
+        if st == "dhcp_ack":
+            if rec["probe"] is None:
+                return "probe_pending"
+            return "dhcp_no_reach"
+        stalled = (now - info["ts"]) > SILENCE_S
+        if not stalled:
+            return "in_progress"
+        if st == "sae_commit":
+            return "silence_after_commit"
+        if st in ("sae_confirm", "authenticated", "associated"):
+            return "assoc_no_eapol"
+        if st == "eapol_done":
+            return "eapol_no_dhcp"
+        return "dhcp_incomplete"   # discover/offer/request, no ack
+
+    def summary(self, now=None):
+        out = {}
+        for mac, rec in self.macs.items():
+            st, info = self.last_stage(mac)
+            out[mac] = {
+                "first_seen": rec["events"][0]["t"] if rec["events"] else None,
+                "attempts": rec["attempts"],
+                "last_stage": st,
+                "last_stage_at": info["t"] if info else None,
+                "ip": rec["ip"],
+                "verdict": self.verdict(mac, now),
+            }
+        return out
+
+    def detail(self, mac, now=None):
+        rec = self.macs.get(mac)
+        stages = {st: None for st in STAGE_ORDER}
+        if rec:
+            for st, info in rec["stages"].items():
+                stages[st] = info["t"]
+        return {
+            "mac": mac,
+            "verdict": self.verdict(mac, now),
+            "attempts": rec["attempts"] if rec else 0,
+            "ip": rec["ip"] if rec else None,
+            "confirm_status": rec["confirm_status"] if rec else None,
+            "probe": rec["probe"] if rec else None,
+            "stages": stages,
+            "events": rec["events"] if rec else [],
+        }
+
+
+# ---------- persistence (follow mode) ----------
+
+def load_state(js):
+    try:
+        with open(os.path.join(STATE_DIR, "state.json")) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return
+    for mac, rec in saved.get("macs", {}).items():
+        base = js.record(mac)
+        base.update({k: rec.get(k, base.get(k)) for k in
+                     ("first_seen", "attempts", "ip", "confirm_status",
+                      "psk_mismatch", "probe", "bundle")})
+        for st, info in rec.get("stages", {}).items():
+            if st in STAGE_ORDER:
+                base["stages"][st] = info
+
+
+def flush_state(js):
+    slim = {}
+    for mac, rec in js.macs.items():
+        slim[mac] = {k: rec[k] for k in
+                     ("first_seen", "attempts", "ip", "confirm_status",
+                      "psk_mismatch", "probe", "bundle", "stages")}
+    atomic_write(os.path.join(STATE_DIR, "state.json"),
+                 json.dumps({"macs": slim, "verdicts": js.summary(
+                     now=time.time())}, indent=1))
+
+
+def append_transcript(mac, ev):
+    path = os.path.join(STATE_DIR, mac_file(mac) + ".jsonl")
+    with open(path, "a") as f:
+        f.write(json.dumps(ev) + "\n")
+    try:
+        if sum(1 for _ in open(path)) > TRIM_AT:
+            lines = open(path).readlines()[-MAX_EVENTS:]
+            atomic_write(path, "".join(lines))
+    except OSError:
+        pass
+
+
+def write_bundle(js, mac):
+    rec = js.macs[mac]
+    if rec["bundle"]:
+        return
+    rec["bundle"] = True
+    path = os.path.join(STATE_DIR, mac_file(mac) + "-first-sight.log")
+
+    def run(cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=10).stdout
+        except Exception as e:
+            return f"({e.__class__.__name__})\n"
+
+    lease = ""
+    try:
+        lease = "".join(l for l in open("/var/lib/misc/dnsmasq.leases")
+                        if mac in l.lower())
+    except OSError:
+        pass
+    body = (f"===== first sight of {mac} "
+            f"{datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')}\n"
+            "--- transcript so far\n"
+            + "".join(json.dumps(e) + "\n" for e in rec["events"][-50:])
+            + "--- iw station get\n" + run(["iw", "dev", "halow0",
+                                            "station", "get", mac])
+            + "--- dnsmasq lease\n" + (lease or "(none)\n")
+            + "--- ip neigh\n" + run(["ip", "neigh"])
+            + "===== end first sight\n")
+    atomic_write(path, body[:MAX_BUNDLE])
+
+
+# ---------- probing (measured, receiver-side) ----------
+
+def probe(js, lock, mac, ip):
+    time.sleep(PROBE_DELAY_S)
+    received = 0
+    try:
+        r = subprocess.run(["ping", "-c", "3", "-W", "2", "-n", ip],
+                           capture_output=True, text=True, timeout=15)
+        m = re.search(r"(\d+) received", r.stdout)
+        received = int(m.group(1)) if m else 0
+    except Exception:
+        pass
+    neigh = ""
+    try:
+        out = subprocess.run(["ip", "-j", "neigh"], capture_output=True,
+                             text=True, timeout=5).stdout
+        neigh = next((n.get("state", [""])[0] for n in json.loads(out or "[]")
+                      if n.get("dst") == ip), "")
+    except Exception:
+        pass
+    with lock:
+        js.set_probe(mac, 3, received, neigh)
+        flush_state(js)
+
+
+# ---------- modes ----------
+
+def parse_stream(js, lines):
+    for line in lines:
+        js.feed(line.rstrip("\n"))
+
+
+def journal_window(hours):
+    hours = max(1, min(int(hours), MAX_HOURS))
+    try:
+        r = subprocess.run(
+            ["journalctl", "-u", "halow-ap", "-u", "dnsmasq",
+             "-o", "short-iso", "-q", "--no-pager",
+             "--since", f"-{hours}h"],
+            capture_output=True, text=True, timeout=30)
+        return r.stdout.splitlines()[-MAX_LINES:]
+    except Exception:
+        return []
+
+
+def follow():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    js = JoinState()
+    lock = threading.Lock()
+    load_state(js)
+    proc = subprocess.Popen(
+        ["journalctl", "-f", "-n", "0", "-u", "halow-ap", "-u", "dnsmasq",
+         "-o", "short-iso", "-q"],
+        stdout=subprocess.PIPE, text=True)
+    last_tick = time.time()
+    for line in proc.stdout:
+        with lock:
+            res = js.feed(line.rstrip("\n"))
+            if res:
+                mac, stage = res
+                new = not js.macs[mac]["bundle"]
+                append_transcript(mac, js.macs[mac]["events"][-1])
+                if new:
+                    write_bundle(js, mac)
+                if stage == "dhcp_ack" and js.macs[mac]["ip"]:
+                    threading.Thread(
+                        target=probe, args=(js, lock, mac,
+                                            js.macs[mac]["ip"]),
+                        daemon=True).start()
+                if stage is not None:
+                    flush_state(js)
+        if time.time() - last_tick > 10:
+            last_tick = time.time()
+            with lock:
+                flush_state(js)   # keeps verdict timeouts fresh for readers
+    return 0
+
+
+# ---------- selftest fixtures ----------
+
+FIX_WRONG_PSK = """\
+2026-08-05T14:00:00-07:00 halow-gw hostapd_s1g[900]: halow0: STA 02:00:49:b6:19:04 SAE: start SAE authentication (RX commit, status=0 (SUCCESS))
+2026-08-05T14:00:01-07:00 halow-gw hostapd_s1g[900]: halow0: STA 02:00:49:b6:19:04 SAE: SAE authentication (RX confirm, status=1)
+2026-08-05T14:00:02-07:00 halow-gw hostapd_s1g[900]: AP-STA-POSSIBLE-PSK-MISMATCH 02:00:49:b6:19:04
+"""
+FIX_RF_SILENCE = """\
+2026-08-05T14:10:00-07:00 halow-gw hostapd_s1g[900]: halow0: STA 02:00:49:b6:19:04 SAE: start SAE authentication (RX commit, status=0 (SUCCESS))
+garbage line that is not a journal line at all
+2026-08-05T14:11:30-07:00 halow-gw dnsmasq-dhcp[800]: DHCPREQUEST(eth0) 192.168.50.20 aa:aa:aa:aa:aa:aa
+"""
+FIX_COMPLETE = """\
+2026-08-05T15:00:00-07:00 halow-gw hostapd_s1g[900]: halow0: STA 02:00:49:b6:19:04 SAE: start SAE authentication (RX commit, status=0 (SUCCESS))
+2026-08-05T15:00:01-07:00 halow-gw hostapd_s1g[900]: halow0: STA 02:00:49:b6:19:04 SAE: SAE authentication (RX confirm, status=0)
+2026-08-05T15:00:01-07:00 halow-gw hostapd_s1g[900]: halow0: STA 02:00:49:b6:19:04 IEEE 802.11: authenticated
+2026-08-05T15:00:02-07:00 halow-gw hostapd_s1g[900]: halow0: STA 02:00:49:b6:19:04 IEEE 802.11: associated (aid 1)
+2026-08-05T15:00:03-07:00 halow-gw hostapd_s1g[900]: AP-STA-CONNECTED 02:00:49:b6:19:04
+2026-08-05T15:00:05-07:00 halow-gw dnsmasq-dhcp[800]: DHCPDISCOVER(halow0) 02:00:49:b6:19:04
+2026-08-05T15:00:05-07:00 halow-gw dnsmasq-dhcp[800]: DHCPOFFER(halow0) 10.117.0.12 02:00:49:b6:19:04
+2026-08-05T15:00:06-07:00 halow-gw dnsmasq-dhcp[800]: DHCPREQUEST(halow0) 10.117.0.12 02:00:49:b6:19:04
+2026-08-05T15:00:06-07:00 halow-gw dnsmasq-dhcp[800]: DHCPACK(halow0) 10.117.0.12 02:00:49:b6:19:04 node2
+"""
+TARGET = "02:00:49:b6:19:04"
+
+
+def selftest():
+    ok = True
+
+    def case(name, fixture, want_verdict, extra=None):
+        nonlocal ok
+        js = JoinState()
+        parse_stream(js, fixture.splitlines())
+        got = js.verdict(TARGET)
+        good = got == want_verdict and (extra is None or extra(js))
+        print(f"{'PASS' if good else 'FAIL'} {name}: verdict={got}"
+              f" (want {want_verdict})")
+        ok = ok and good
+
+    case("wrong-psk", FIX_WRONG_PSK, "sae_confirm_failed")
+    case("rf-silence", FIX_RF_SILENCE, "silence_after_commit")
+    case("complete-await-probe", FIX_COMPLETE, "probe_pending",
+         extra=lambda js: js.macs[TARGET]["ip"] == "10.117.0.12"
+         and js.macs[TARGET]["stages"].get("dhcp_ack") is not None
+         and js.macs[TARGET]["attempts"] == 1)
+
+    # probe path: 3/3 flips to complete, 0/3 to dhcp_no_reach
+    js = JoinState()
+    parse_stream(js, FIX_COMPLETE.splitlines())
+    js.set_probe(TARGET, 3, 3, "REACHABLE")
+    good = js.verdict(TARGET) == "complete"
+    print(f"{'PASS' if good else 'FAIL'} probe-3of3-complete")
+    ok = ok and good
+    js2 = JoinState()
+    parse_stream(js2, FIX_COMPLETE.splitlines())
+    js2.set_probe(TARGET, 3, 0, "FAILED")
+    good = js2.verdict(TARGET) == "dhcp_no_reach"
+    print(f"{'PASS' if good else 'FAIL'} probe-0of3-no-reach")
+    ok = ok and good
+
+    # unknown MAC + garbage resilience
+    js3 = JoinState()
+    parse_stream(js3, ["complete garbage", "", "2026-08-05T15:00:00-07:00 x"])
+    good = js3.verdict("de:ad:be:ef:00:00") == "never_seen"
+    print(f"{'PASS' if good else 'FAIL'} garbage-and-unknown-mac")
+    ok = ok and good
+    return 0 if ok else 1
+
+
+def main(argv):
+    args = [a for a in argv[1:]]
+    if "--selftest" in args:
+        return selftest()
+    if "--follow" in args:
+        return follow()
+    hours = 24
+    if "--since-hours" in args:
+        i = args.index("--since-hours")
+        hours = int(args[i + 1])
+        del args[i:i + 2]
+    if "--parse-file" in args:
+        i = args.index("--parse-file")
+        js = JoinState()
+        with open(args[i + 1]) as f:
+            parse_stream(js, f)
+        print(json.dumps({"stations": js.summary()}, indent=1))
+        return 0
+    js = JoinState()
+    parse_stream(js, journal_window(hours))
+    # fold in follow-mode state (probe results, bundle flags)
+    saved = JoinState()
+    load_state(saved)
+    for mac, rec in saved.macs.items():
+        if mac in js.macs:
+            js.macs[mac]["probe"] = js.macs[mac]["probe"] or rec["probe"]
+            js.macs[mac]["bundle"] = rec["bundle"]
+            if rec["stages"].get("reachable"):
+                js.macs[mac]["stages"]["reachable"] = rec["stages"]["reachable"]
+        elif rec["stages"]:
+            js.macs[mac] = rec   # older than the window; keep the record
+    now = time.time()
+    if args and MAC_RE.fullmatch(args[0] or ""):
+        print(json.dumps(js.detail(args[0].lower(), now=now), indent=1))
+        return 0
+    print(json.dumps({"window_hours": hours,
+                      "stations": js.summary(now=now)}, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

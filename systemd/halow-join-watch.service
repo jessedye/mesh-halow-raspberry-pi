@@ -1,0 +1,14 @@
+[Unit]
+Description=HaLow association forensics watcher (per-MAC join transcripts)
+After=halow-ap.service
+BindsTo=halow-ap.service
+
+[Service]
+Type=simple
+User=halow-ui
+ExecStart=/usr/local/bin/halow-join-log --follow
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=halow-ap.service

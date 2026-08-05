@@ -7,6 +7,7 @@
 #   halowctl set KEY=VAL ... [confirm=1]   override channel=N width=M ssid=S (persisted; same guard)
 #   halowctl gen               regenerate hostapd conf from env+profile
 #   halowctl stations          associated STA dump
+#   halowctl join-log [mac|--all|--selftest]  association forensics (read-only)
 #   halowctl mode ap|sta       broadcast the SSID, or join it as a station
 #   halowctl probe             reload the driver and report chip probe result
 #   halowctl restart|stop      control the AP service
@@ -202,6 +203,14 @@ ieee80211w=2
 sae_password=${HALOW_PASSPHRASE}
 ctrl_interface=/var/run/hostapd_s1g
 ctrl_interface_group=halow-ui
+# Join forensics (halow-join-log): stdout->journal at debugging level so
+# per-STA SAE commit/confirm records are captured; syslog stays at INFO.
+# Deliberately NOT the -d/-dd flags — at -dd wpa_printf can dump EAPOL
+# key material. These conf keys are the bounded, secret-safe knob.
+logger_syslog=-1
+logger_syslog_level=2
+logger_stdout=-1
+logger_stdout_level=1
 EOF
   echo "generated $CONF: ${HALOW_SSID} ch=$CH op_class=$OP width=${WIDTH}MHz"
 }
@@ -272,6 +281,10 @@ PY
     ;;
   stations)
     iw dev "${HALOW_IF:-halow0}" station dump 2>/dev/null || echo "no stations / interface down"
+    ;;
+  join-log)
+    shift
+    exec /usr/local/bin/halow-join-log "$@"
     ;;
   mode)
     m=${2:?usage: halowctl mode ap|sta}
@@ -459,6 +472,7 @@ dhcp-option=option:router,10.117.0.1
 dhcp-option=option:dns-server,${DNS}
 dhcp-option=option:ntp-server,10.117.0.1
 dhcp-authoritative
+log-dhcp
 EOF
     sudo systemctl restart dnsmasq && echo "dhcp: ${START}-${END} lease ${LEASE} dns ${DNS}"
     ;;

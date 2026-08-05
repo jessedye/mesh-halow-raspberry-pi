@@ -119,7 +119,14 @@ nothing on the v1 rejected list); verifier corrections are folded in.
 
 ### Tier 1 — before the capacitor goes on (first-association payoff)
 
-16. **Association forensics** — per-MAC join transcript with
+16. **Association forensics** — DONE 2026-08-05 pre-association scope
+    (halow-join-log parser/verdict engine + selftest fixtures, hostapd_s1g
+    logger keys accepted by the Morse fork [M], log-dhcp in BOTH dnsmasq
+    templates, halow-join-watch daemon rides BindsTo restarts, 3 API
+    routes + Debug-tab card; secret check measured 0 PSK hits at the new
+    logger level. Marker strings stay [C] until runs 7-9 capture them from
+    a real attempt — wrong-PSK, RF-death, clean join — which need a
+    station). — per-MAC join transcript with
     stage-of-failure verdict (SAE commit/confirm → assoc → 4-way EAPOL →
     DHCP → first ARP/ICMP), including FAILED attempts; auto-capture an
     evidence bundle on first sight of a new MAC (first-contact pattern).
