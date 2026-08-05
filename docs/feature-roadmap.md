@@ -188,7 +188,19 @@ nothing on the v1 rejected list); verifier corrections are folded in.
     written against a live target. Measurement-only responder (echo
     returns exactly what arrived, no control surface), bound to halow0.
     [medium/high]
-20. **Measured TRANSPORT_HALOW rung-cost endpoint** — `GET
+20. **Measured TRANSPORT_HALOW rung-cost endpoint** — DONE 2026-08-05
+    pre-association scope (halow_rungcost pure logic 15/15 selftest:
+    anchors exact — 604 kbps [M] -> cost 10 ties ESP-NOW at ESP-NOW's
+    measured rate, 9 kbps [M] -> 99, floor 6 never outranks wifi=5;
+    vip.py hysteresis proven incl. absent-counts-bad live on the real
+    timer; corrupt state -> fresh start, monitor survives; 20x kill -9
+    -> zero torn files; staleness fail-safe verified — a dead monitor
+    serves healthy:false/cost:null; single-MAC body 391 B [M], inside
+    the node's one-TLS-session budget. First real windows + the
+    forced-bad antenna run + the iperf3 ordering cross-check need a
+    station. tx_failed presence on this driver is UNVERIFIED until
+    then — if absent, every window is no-counters and health is never
+    earned, by design.) — `GET
     /api/halow/rungcost/<mac>`: per-MAC cost + healthy boolean from
     windowed measured rate/delivery (current link API delivery_pct is
     lifetime-cumulative — windowing is the new work), damped vip.py-style

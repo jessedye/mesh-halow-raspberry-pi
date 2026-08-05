@@ -18,6 +18,7 @@ METRICS = os.path.join(STATE_DIR, "metrics.jsonl")
 STATE = os.path.join(STATE_DIR, "mon-state.json")
 HEALTH = os.path.join(STATE_DIR, "station-health.json")
 EVENTS_LOG = os.path.join(STATE_DIR, "station-events.log")
+RUNGCOST = os.path.join(STATE_DIR, "rungcost-state.json")
 RING_LINES = 2880  # 2 days at 1/min
 UPSTREAM = "192.168.50.1"
 DISK_LOW_MB = 512  # SD low-water; mirrored in halow_ui.py
@@ -183,6 +184,47 @@ def classify(assoc, ip, arp_ok, icmp_ok, last_seen_assoc, interval_s, now,
     if now - last_seen_assoc <= HOLD_MULTIPLIER * interval_s:
         return "quiet", ""
     return "lost", f"silent past {HOLD_MULTIPLIER}x{interval_s}s"
+
+
+def rungcost_step(parsed, now):
+    """Measured TRANSPORT_HALOW rung cost (roadmap 20): one window per
+    run through halow_rungcost's pure logic. Runs even with zero
+    stations — all-absent is a result, not a skip. Corrupt state means
+    fresh start, never a wedged monitor (#22's lesson)."""
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import halow_rungcost as rc
+    try:
+        state = json.load(open(RUNGCOST))
+        if not isinstance(state.get("stations"), dict):
+            raise ValueError
+    except Exception:
+        state = {"v": 1, "stations": {}}
+    stations = state["stations"]
+    seen = {e["mac"]: e for e in parsed}
+    for mac in set(stations) | set(seen):
+        entry = stations.get(mac)
+        if entry is None:
+            entry = stations[mac] = rc.fresh_entry(now)
+        cur = seen.get(mac)
+        v, w = rc.evaluate_window(entry.get("last"),
+                                  {**cur, "t": now} if cur else None)
+        rc.step(entry, v, w, now)
+        if cur is not None:
+            # store the new baseline on every sighting — including after
+            # a reset verdict (reassociation), which is the point
+            entry["last"] = {"t": now, **{k: cur[k] for k in
+                             ("tx_packets", "tx_retries", "tx_failed",
+                              "tx_mbps", "signal_dbm") if k in cur}}
+            entry["last_seen"] = now
+    for mac in [m for m, e in stations.items()
+                if now - e.get("last_seen", 0) > 172800]:
+        del stations[mac]   # 2-day eviction, the stations.jsonl horizon
+    while len(stations) > 64:
+        del stations[min(stations, key=lambda m:
+                         stations[m].get("last_seen", 0))]
+    state["t"] = now
+    atomic_write(RUNGCOST, json.dumps(state))
 
 
 def load_health():
@@ -408,6 +450,11 @@ def main():
         subprocess.run(["logger", "-t", "halow-mon",
                         f"health walk failed: {e.__class__.__name__}: {e}"])
         sta_reachable = None
+    try:
+        rungcost_step(parsed, now)
+    except Exception as e:
+        subprocess.run(["logger", "-t", "halow-mon",
+                        f"rungcost step failed: {e.__class__.__name__}: {e}"])
 
     # --- sample ---
     thr = sh("vcgencmd get_throttled")

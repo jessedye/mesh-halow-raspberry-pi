@@ -74,6 +74,7 @@ sudo install -m755 scripts/halow-mon /usr/local/bin/
 sudo install -m755 scripts/halow-sta-events /usr/local/bin/
 sudo install -m755 scripts/halow-join-log /usr/local/bin/
 sudo install -m755 scripts/halow-linkd /usr/local/bin/
+sudo install -m755 scripts/halow_rungcost.py /usr/local/bin/
 sudo mkdir -p /var/lib/halow && sudo chown halow-ui:halow-ui /var/lib/halow
 sudo install -m440 config/sudoers-halow-ui /etc/sudoers.d/halow-ui
 sudo mkdir -p /usr/local/lib && sudo install -m644 ui/halow_ui.py /usr/local/lib/

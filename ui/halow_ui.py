@@ -1007,6 +1007,68 @@ def api_halow_link(mac=None):
     return jsonify({"stations": out})
 
 
+RUNGCOST_STATE = "/var/lib/halow/rungcost-state.json"
+RUNGCOST_STALE_S = 180  # three missed monitor runs
+
+
+@app.get("/api/halow/rungcost")
+@app.get("/api/halow/rungcost/<mac>")
+@authed
+def api_halow_rungcost(mac=None):
+    """Measured TRANSPORT_HALOW rung cost — the node implementer's
+    reference (mesh-v4 halowPeriodicCheck consumer contract).
+
+    cost = clamp(round(100 - 49.3*log10(goodput_kbps_ewma/9.0)), 6, 99)
+    anchored on the ladder's two MEASURED rates: LoRa best 9.0 kbps [M]
+    -> 100, ESP-NOW healthy 604 kbps [M] -> 10. Windowed iw counter
+    deltas (never lifetime-cumulative), vip.py hysteresis (demote after
+    2 bad windows, promote after 3 good), EWMA alpha 0.3. healthy=false
+    -> cost=null: no fabricated numbers for an unmeasurable link.
+
+    Consumer contract: a node fetches its own MAC once per
+    halow_check_min (default 30 min, floor 5); on healthy && !stale it
+    MAY write cost into metric_halow. Gateway healthy is AP-side
+    evidence; the node ANDs it with its local halowRungHealthy() — the
+    two can legitimately disagree. Staleness (state older than 180s =
+    three missed monitor runs) fail-safes to healthy:false, cost:null:
+    a gateway whose monitor died must not advertise a healthy rung."""
+    try:
+        st = json.load(open(RUNGCOST_STATE))
+    except Exception:
+        st = {"t": 0, "stations": {}}
+    t = st.get("t", 0)
+    age = max(0, int(time.time() - t))   # clamp: an NTP step must not
+    stale = age > RUNGCOST_STALE_S       # fabricate staleness
+
+    def shape(m, e):
+        out = {"mac": m,
+               "healthy": bool(e.get("healthy")) and not stale,
+               "cost": None if stale else e.get("cost"),
+               "stale": stale, "age_s": age,
+               "goodput_kbps_ewma": e.get("goodput_kbps_ewma"),
+               "window": e.get("window"),
+               "streaks": {"oks": e.get("oks", 0),
+                           "fails": e.get("fails", 0)},
+               "windows": e.get("windows", {}),
+               "source": "windowed iw counter deltas, AP-side, "
+                         "MAC-ack confirmed"}
+        if stale:
+            out["reason"] = "monitor stale"
+        return out
+
+    if mac is not None:
+        m = mac.lower()
+        e = st.get("stations", {}).get(m)
+        if e is None:
+            return jsonify({"error": f"no rungcost state for {mac}",
+                            "stations": list(st.get("stations", {}))})
+        return jsonify(shape(m, e))
+    return jsonify({"t": t, "stale": stale,
+                    "stations": {m: shape(m, e)
+                                 for m, e in st.get("stations",
+                                                    {}).items()}})
+
+
 @app.get("/api/metrics")
 @authed
 def api_metrics():
@@ -1472,6 +1534,7 @@ async function monCard(){try{const m=await j("/api/metrics?minutes=1440");
 async function halow(){const h=await j("/api/halow");
  let cc=null;try{cc=await j("/api/halow/compat")}catch(e){}
  let lk={stations:{}};try{lk=await j("/api/halow/link")}catch(e){}
+ let rcx={stations:{}};try{rcx=await j("/api/halow/rungcost")}catch(e){}
  const hcls=v=>v==="reachable"?"ok":(v==="quiet"||v==="never-seen"||v==="assoc-no-lease")?"warn":"bad";
  const ago=t=>t?new Date(t*1000).toISOString().replace("T"," ").slice(0,19):"—";
  const profs=Object.entries(h.profiles).map(([n,p])=>{
@@ -1482,11 +1545,16 @@ async function halow(){const h=await j("/api/halow");
    <td><button class="act" ${n===h.profile?"disabled":""}
      onclick="setProf('${n}')">apply</button></td></tr>`}).join("");
  const stas=h.stations.length?h.stations.map(s=>{
-  const hh=(lk.stations[(s.mac||"").toLowerCase()]||{}).health;
+  const m=(s.mac||"").toLowerCase();
+  const hh=(lk.stations[m]||{}).health;
+  const rr=rcx.stations[m];
+  const rung=rr?(rr.stale?`<span class="bad">stale</span>`:
+   rr.healthy?`<span class="ok">${rr.cost}</span>`:
+   `<span class="warn">unhealthy</span>`):"—";
   return `<tr><td>${esc(s.mac)}</td><td>${esc(s.signal||"")}</td><td>${esc(s.tx_bitrate||"")}</td>
    <td>${esc(s.rx_bitrate||"")}</td><td>${esc(s.connected_time||"")}</td>
-   <td class="${hh?hcls(hh.state):''}">${esc(hh?hh.state:"—")}</td></tr>`}).join("")
-  :`<tr><td colspan=6 class="warn">no stations associated</td></tr>`;
+   <td class="${hh?hcls(hh.state):''}">${esc(hh?hh.state:"—")}</td><td>${rung}</td></tr>`}).join("")
+  :`<tr><td colspan=7 class="warn">no stations associated</td></tr>`;
  const known=Object.entries(lk.stations).filter(([m,v])=>v.health).map(([m,v])=>
   `<tr><td>${esc(m)}</td><td class="${hcls(v.health.state)}">${esc(v.health.state||"")}</td>
    <td>${esc(v.health.ip||"—")}</td><td>${v.health.expected_interval_s||"—"}s</td>
@@ -1505,7 +1573,7 @@ async function halow(){const h=await j("/api/halow");
  — valid US: 1MHz odd 1-51 · 2MHz 2,6..50 · 4MHz 8,16..48 · 8MHz 12,28,44</p>
  <pre id="halow-out"></pre></div>
  <div class="card"><h2>stations</h2>
- <table><tr><th>mac</th><th>signal</th><th>tx</th><th>rx</th><th>connected</th><th>health</th></tr>${stas}</table></div>
+ <table><tr><th>mac</th><th>signal</th><th>tx</th><th>rx</th><th>connected</th><th>health</th><th>rung cost</th></tr>${stas}</table></div>
  <div class="card"><h2>known stations (health ladder)</h2>
  <table><tr><th>mac</th><th>state</th><th>ip</th><th>interval</th><th>last assoc</th></tr>${known}</table>
  <p style="color:var(--dim)">assoc→lease→ARP→ICMP walked each minute; absent stations judged by

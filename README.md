@@ -119,6 +119,7 @@ mesh-v4 token; only its sha256 is stored on the gateway).
 | `GET /api/halow/compat` | — (pinned-set verdicts; optional `profile`/`channel`/`width`/`ssid` candidate) |
 | `GET /api/halow/join-log[/<mac>[/bundle]]` | — (association forensics: per-MAC stage transcript + verdict; `hours=` ≤48) |
 | `GET /api/halow/linktest` | — (receiver-counted UDP link tests + responder state; wire format: `docs/udp-linktest-protocol.md`) |
+| `GET /api/halow/rungcost[/<mac>]` | — (measured TRANSPORT_HALOW cost: windowed deltas + hysteresis; node consumer contract in the endpoint docstring) |
 | `POST /api/halow/linktest/selftest` | `count` ≤1000, `size` ≤1400 (bounded loopback run) |
 | `POST /api/halow/probe` | — |
 
