@@ -21,7 +21,7 @@ echo "== sync repo"
 rsync -a --delete --exclude .git --exclude secrets.env "$REPO/" "$PI:mesh-halow-raspberry-pi/"
 
 echo "== packages"
-ssh "$PI" 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq python3-flask isc-dhcp-client iperf3 >/dev/null 2>&1; true'
+ssh "$PI" 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq python3-flask isc-dhcp-client iperf3 conntrack bind9-dnsutils >/dev/null 2>&1; true'
 
 echo "== /etc/halow"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT; umask 077
@@ -49,6 +49,7 @@ ssh "$PI" 'set -e
 cd ~/mesh-halow-raspberry-pi
 sudo mkdir -p /etc/halow
 id halow-ui >/dev/null 2>&1 || sudo useradd -r -s /usr/sbin/nologin -G systemd-journal halow-ui
+sudo usermod -aG video halow-ui 2>/dev/null || true
 # Never clobber live operator state (profile/SSID/mode edits) on redeploy.
 # Group halow-ui: the console reads SSID/profile/mode from this file.
 [ -f /etc/halow/halow.env ] || sudo install -m640 -o root -g halow-ui /tmp/halow-deploy/halow.env /etc/halow/

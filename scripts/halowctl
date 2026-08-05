@@ -134,6 +134,10 @@ PY
       sudo systemctl restart halow-sta 2>/dev/null || echo "STA starts when halow0 appears"
     fi
     ;;
+  chip)
+    morse_cli -i "${HALOW_IF:-halow0}" version 2>&1
+    morse_cli -i "${HALOW_IF:-halow0}" stats 2>&1 | head -40
+    ;;
   probe)
     sudo sh -c "rmmod morse 2>/dev/null; modprobe morse"
     sleep 4

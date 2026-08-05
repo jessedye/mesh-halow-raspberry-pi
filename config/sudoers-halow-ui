@@ -13,5 +13,7 @@ halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl wifi-passphrase
 halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl dhcp-config *
 halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl forwards *
 halow-ui ALL=(root) NOPASSWD: /usr/sbin/nft list table ip halow
+halow-ui ALL=(root) NOPASSWD: /usr/local/bin/halowctl chip
+halow-ui ALL=(root) NOPASSWD: /usr/sbin/conntrack -L *
 halow-ui ALL=(root) NOPASSWD: /usr/bin/systemctl restart halow-ap
 halow-ui ALL=(root) NOPASSWD: /usr/sbin/reboot

@@ -499,6 +499,197 @@ def api_logs():
     return jsonify({"unit": unit, "lines": out.splitlines()})
 
 
+# ---------- Diagnostics ----------
+
+import re as _re2
+
+HOSTNAME_RE = _re2.compile(r"^[A-Za-z0-9.\-]{1,253}$")
+THROTTLE_BITS = {
+    0: "undervoltage NOW", 1: "arm freq capped NOW", 2: "throttled NOW",
+    3: "soft temp limit NOW", 16: "undervoltage occurred",
+    17: "arm freq capped occurred", 18: "throttled occurred",
+    19: "soft temp limit occurred",
+}
+
+
+@app.post("/api/diag/ping")
+@authed
+def api_diag_ping():
+    target = request.form.get("target", "")
+    if not HOSTNAME_RE.match(target):
+        return jsonify({"error": "bad target"}), 400
+    n = min(int(request.form.get("count", "5")), 20)
+    out = sh(f"ping -c {n} -i 0.3 -W 2 -n {target}", timeout=n * 3 + 10)
+    times = [float(m) for m in _re2.findall(r"time=([\d.]+) ms", out)]
+    stats = _re2.search(r"(\d+) packets transmitted, (\d+) received", out)
+    sent = int(stats.group(1)) if stats else n
+    recv = int(stats.group(2)) if stats else 0
+    return jsonify({
+        "target": target, "sent": sent, "received": recv,
+        "loss_pct": round(100 * (sent - recv) / sent, 1) if sent else None,
+        "min_ms": min(times) if times else None,
+        "avg_ms": round(sum(times) / len(times), 2) if times else None,
+        "max_ms": max(times) if times else None,
+        "probes_ms": times,
+        "note": f"n={sent}; loss at small n is a sample, not a rate",
+    })
+
+
+@app.post("/api/diag/tcpcheck")
+@authed
+def api_diag_tcpcheck():
+    host = request.form.get("host", "")
+    if not HOSTNAME_RE.match(host):
+        return jsonify({"error": "bad host"}), 400
+    port = int(request.form.get("port", "443"))
+    scheme = "https" if request.form.get("tls", "1") == "1" else "http"
+    url = f"{scheme}://{host}:{port}{request.form.get('path', '/')}"
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(url, method="HEAD")
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=6, context=ctx) as r:
+            return jsonify({"url": url, "status": r.status,
+                            "ms": round((time.monotonic() - t0) * 1000, 1)})
+    except urllib.error.HTTPError as e:
+        return jsonify({"url": url, "status": e.code,
+                        "ms": round((time.monotonic() - t0) * 1000, 1),
+                        "note": "server answered — the path is up"})
+    except Exception as e:
+        return jsonify({"url": url, "error": str(e),
+                        "ms": round((time.monotonic() - t0) * 1000, 1)}), 502
+
+
+@app.post("/api/diag/dns")
+@authed
+def api_diag_dns():
+    name = request.form.get("name", "")
+    if not HOSTNAME_RE.match(name):
+        return jsonify({"error": "bad name"}), 400
+    server = request.form.get("server", "")
+    if server and not HOSTNAME_RE.match(server):
+        return jsonify({"error": "bad server"}), 400
+    at = f"@{server} " if server else ""
+    out = sh(f"dig +time=3 +tries=1 {at}{name} A +noall +answer +stats",
+             timeout=10)
+    answers = _re2.findall(r"\sA\s+([\d.]+)", out)
+    qtime = _re2.search(r"Query time: (\d+) msec", out)
+    return jsonify({"name": name, "server": server or "(system)",
+                    "answers": answers,
+                    "ms": int(qtime.group(1)) if qtime else None,
+                    "ok": bool(answers)})
+
+
+@app.get("/api/diag/neigh")
+@authed
+def api_diag_neigh():
+    try:
+        neigh = json.loads(sh("ip -j neigh") or "[]")
+    except Exception:
+        neigh = []
+    return jsonify({"neighbors": [
+        {"ip": x.get("dst"), "dev": x.get("dev"),
+         "mac": x.get("lladdr", ""), "state": (x.get("state") or [""])[0]}
+        for x in neigh]})
+
+
+@app.get("/api/diag/survey")
+@authed
+def api_diag_survey():
+    out = sh("iw dev halow0 survey dump")
+    surveys = []
+    cur = None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("frequency:"):
+            cur = {"frequency": line.split(":", 1)[1].strip()}
+            surveys.append(cur)
+        elif cur is not None and ":" in line:
+            k, v = line.split(":", 1)
+            cur[k.strip().replace(" ", "_")] = v.strip()
+    in_use = next((s for s in surveys if "[in use]" in s.get("frequency", "")), None)
+    util = None
+    if in_use:
+        try:
+            active = int(in_use.get("channel_active_time", "0 ms").split()[0])
+            busy = int(in_use.get("channel_busy_time", "0 ms").split()[0])
+            util = round(100 * busy / active, 1) if active else None
+        except Exception:
+            pass
+    return jsonify({"surveys": surveys, "utilization_pct": util})
+
+
+@app.get("/api/diag/power")
+@authed
+def api_diag_power():
+    raw = sh("vcgencmd get_throttled").strip()
+    m = _re2.search(r"0x([0-9a-fA-F]+)", raw)
+    val = int(m.group(1), 16) if m else None
+    flags = ([THROTTLE_BITS[b] for b in THROTTLE_BITS if val & (1 << b)]
+             if val is not None else ["vcgencmd unavailable"])
+    return jsonify({
+        "throttled_raw": raw or None,
+        "flags": flags or ["clean — no undervoltage or throttling recorded"],
+        "temp_c": round(int(open("/sys/class/thermal/thermal_zone0/temp")
+                            .read()) / 1000, 1),
+        "volts_core": sh("vcgencmd measure_volts core").strip() or None,
+    })
+
+
+@app.get("/api/diag/flows")
+@authed
+def api_diag_flows():
+    out = sh("sudo /usr/sbin/conntrack -L -o extended 2>/dev/null | head -200",
+             timeout=15)
+    return jsonify({"flows": out.splitlines(), "capped_at": 200})
+
+
+@app.get("/api/diag/chip")
+@authed
+def api_diag_chip():
+    ok, out = halowctl(["chip"], timeout=20)
+    return jsonify({"ok": ok, "output": out})
+
+
+@app.get("/api/diag")
+@authed
+def api_diag_bundle():
+    """One-shot bundle — the gateway's answer to the nodes' /api/diag."""
+    services = {}
+    for u in ("halow-ap", "halow-net", "halow-ui", "dnsmasq",
+              "halow-iperf3", "halow-sta-events"):
+        services[u] = {
+            "active": sh(f"systemctl is-active {u}").strip(),
+            "restarts": sh(f"systemctl show -p NRestarts --value {u}").strip(),
+        }
+    leases = []
+    try:
+        with open("/var/lib/misc/dnsmasq.leases") as f:
+            leases = [x.split() for x in f]
+    except OSError:
+        pass
+    events = []
+    try:
+        with open(EVENTS_LOG) as f:
+            events = [x.strip() for x in f.readlines()[-10:]]
+    except OSError:
+        pass
+    return jsonify({
+        "system": json.loads(api_system().get_data()),
+        "power": json.loads(api_diag_power().get_data()),
+        "interfaces": json.loads(sh("ip -j addr") or "[]"),
+        "routes": json.loads(sh("ip -j route") or "[]"),
+        "neighbors": json.loads(api_diag_neigh().get_data())["neighbors"],
+        "halow": json.loads(api_halow().get_data()),
+        "services": services,
+        "leases": leases,
+        "recent_events": events,
+        "survey": json.loads(api_diag_survey().get_data()),
+    })
+
+
 # ---------- Mesh nodes ----------
 
 def node_get(node, path):
@@ -647,7 +838,7 @@ border-radius:6px;padding:5px 8px;font:inherit;width:110px}
 <a href="/logout" style="color:var(--dim);margin-left:14px;text-decoration:none">logout</a></header>
 <main id="main"></main>
 <script>
-const TABS=["Overview","HaLow","Router","Config","Nodes","Debug"];let tab="Overview";
+const TABS=["Overview","HaLow","Router","Config","Nodes","Diag","Debug"];let tab="Overview";
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 async function j(u,opt){const r=await fetch(u,opt);if(!r.ok)throw new Error(r.status);return r.json()}
@@ -659,7 +850,53 @@ async function render(){nav();const m=$("#main");m.innerHTML="<p class='warn'>lo
  else if(tab==="Router")m.innerHTML=await router();
  else if(tab==="Config")m.innerHTML=await config();
  else if(tab==="Debug")m.innerHTML=await debug();
+ else if(tab==="Diag")m.innerHTML=await diag();
  else m.innerHTML=await nodes();}catch(e){m.innerHTML=`<p class="bad">${esc(e)}</p>`}}
+async function diag(){const nb=await j("/api/diag/neigh"),sv=await j("/api/diag/survey"),pw=await j("/api/diag/power");
+ const neigh=nb.neighbors.length?nb.neighbors.map(x=>{
+  const c=x.state==="REACHABLE"?"ok":(x.state==="FAILED"?"bad":"warn");
+  return `<tr><td>${esc(x.ip)}</td><td>${esc(x.dev)}</td><td>${esc(x.mac)}</td><td class="${c}">${esc(x.state)}</td></tr>`}).join("")
+  :`<tr><td colspan=4 class="warn">none</td></tr>`;
+ return `<div class="card"><h2>ping</h2>
+ <p>target <input id="p-t" placeholder="10.117.0.50 or 192.168.50.1">
+ count <input id="p-n" value="5" style="width:50px">
+ <button class="act" onclick="dPing(this)">run</button></p><pre id="p-out"></pre></div>
+ <div class="card"><h2>service check (HTTP HEAD — never bare connects)</h2>
+ <p>host <input id="c-h" placeholder="192.168.50.103"> port <input id="c-p" value="443" style="width:60px">
+ <label><input type="checkbox" id="c-tls" checked style="width:auto">TLS</label>
+ <button class="act" onclick="dTcp(this)">check</button></p><pre id="c-out"></pre></div>
+ <div class="card"><h2>DNS check</h2>
+ <p>name <input id="d-n" placeholder="example.com"> server <input id="d-s" placeholder="(system)">
+ <button class="act" onclick="dDns(this)">resolve</button></p><pre id="d-out"></pre></div>
+ <div class="card"><h2>neighbors (ARP/NDP)</h2>
+ <table><tr><th>ip</th><th>dev</th><th>mac</th><th>state</th></tr>${neigh}</table>
+ <p style="color:var(--dim)">FAILED with a known mac = the "associated but answers no ARP" trap.</p></div>
+ <div class="card"><h2>power / throttling</h2>
+ <p>${pw.temp_c}°C · ${esc(pw.volts_core||"")} · ${pw.flags.map(f=>
+  `<span class="${f.includes("NOW")?"bad":(f.includes("occurred")?"warn":"ok")}">${esc(f)}</span>`).join(" · ")}</p></div>
+ <div class="card"><h2>channel survey</h2>
+ <p>utilization: ${sv.utilization_pct!=null?sv.utilization_pct+"%":"n/a"}</p>
+ <pre>${esc(sv.surveys.map(s=>JSON.stringify(s)).join("\n").slice(0,1500))}</pre></div>
+ <div class="card"><h2>more</h2>
+ <p><button class="act" onclick="dLoad('/api/diag/flows','flows',d=>d.flows.join("\n")||"(none)")">NAT flows</button>
+ <button class="act" onclick="dLoad('/api/diag/chip','chip',d=>d.output)">chip counters</button>
+ <a class="act" style="text-decoration:none;padding:6px 12px" href="/api/diag" target="_blank">full diag bundle (JSON)</a></p>
+ <pre id="m-out"></pre></div>`}
+async function dPing(b){b.disabled=true;try{const fd=new FormData();
+ fd.append("target",$("#p-t").value);fd.append("count",$("#p-n").value);
+ const d=await(await fetch("/api/diag/ping",{method:"POST",body:fd})).json();
+ $("#p-out").textContent=d.error||`${d.received}/${d.sent} received, loss ${d.loss_pct}%  rtt ${d.min_ms}/${d.avg_ms}/${d.max_ms} ms\nprobes: ${d.probes_ms.join(", ")}\n${d.note}`}finally{b.disabled=false}}
+async function dTcp(b){b.disabled=true;try{const fd=new FormData();
+ fd.append("host",$("#c-h").value);fd.append("port",$("#c-p").value);
+ fd.append("tls",$("#c-tls").checked?"1":"0");
+ const d=await(await fetch("/api/diag/tcpcheck",{method:"POST",body:fd})).json();
+ $("#c-out").textContent=d.error?`${d.url}: ${d.error} (${d.ms} ms)`:`${d.url}: HTTP ${d.status} in ${d.ms} ms ${d.note||""}`}finally{b.disabled=false}}
+async function dDns(b){b.disabled=true;try{const fd=new FormData();
+ fd.append("name",$("#d-n").value);if($("#d-s").value)fd.append("server",$("#d-s").value);
+ const d=await(await fetch("/api/diag/dns",{method:"POST",body:fd})).json();
+ $("#d-out").textContent=d.error||`${d.name} via ${d.server}: ${d.ok?d.answers.join(", "):"NO ANSWER"} (${d.ms} ms)`}finally{b.disabled=false}}
+async function dLoad(url,label,fmt){const d=await j(url);
+ $("#m-out").textContent=`== ${label}\n`+fmt(d)}
 async function debug(){const ev=await j("/api/halow/events"),tp=await j("/api/halow/throughput");
  const runs=tp.runs.length?tp.runs.slice(-10).reverse().map(r=>
   `<tr><td>${esc(r.at)}</td><td>${esc(r.target)}</td><td>${r.reverse?"AP→STA":"STA→AP"}</td><td>${r.mbps} Mbps</td></tr>`).join("")
