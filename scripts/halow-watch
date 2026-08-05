@@ -40,8 +40,9 @@ HOLD_MULTIPLIER = 3       # nodewatch.py:52
 FALLBACK_INTERVAL = 3600  # under-alerting beats crying wolf
 REQ_TIMEOUT = 10
 RING_LINES = 2880
-REPORT_FIELDS = ("heap_free", "wifi_rssi", "air_util_tx",
+REPORT_FIELDS = ("heap_free", "rssi", "air_util_tx",
                  "channel_utilization")  # whitelist — never the whole body
+                 # (rssi = data.wifi.rssi flattened; captured 2026-08-05)
 
 SSL_CTX = ssl._create_unverified_context()  # fleet certs are self-signed
 
@@ -119,15 +120,28 @@ def load_leases():
     return out
 
 
-def station_macs():
+def station_signals():
+    """{mac: signal_dbm|None} for associated stations — the gateway's own
+    receiver-side view of each node's HaLow link."""
+    out = {}
     try:
         dump = subprocess.run(["iw", "dev", "halow0", "station", "dump"],
                               capture_output=True, text=True,
                               timeout=10).stdout
-        return {l.split()[1].lower() for l in dump.splitlines()
-                if l.startswith("Station")}
+        cur = None
+        for line in dump.splitlines():
+            s = line.strip()
+            if s.startswith("Station"):
+                cur = s.split()[1].lower()
+                out[cur] = None
+            elif cur and s.startswith("signal:"):
+                try:
+                    out[cur] = int(s.split(":", 1)[1].split()[0])
+                except (ValueError, IndexError):
+                    pass
     except Exception:
-        return set()
+        pass
+    return out
 
 
 def host_of(url):
@@ -193,7 +207,8 @@ def poll_cycle(states, cfg, now):
     nodes = load_nodes()
     reservations = load_reservations()
     leases = load_leases()
-    assoc = station_macs()
+    signals = station_signals()
+    assoc = set(signals)
     out_nodes = []
     alive_peers = []
 
@@ -206,6 +221,7 @@ def poll_cycle(states, cfg, now):
                  "checked_at": now, "alerts": [], "rtt_ms": None,
                  "consecutive_failures": st.fails,
                  "assoc": {"associated": mac in assoc if mac else False,
+                           "signal_dbm": signals.get(mac),
                            "lease_ip": leases.get(mac, {}).get("ip"),
                            "reservation_ip":
                            reservations.get(mac, {}).get("ip")},

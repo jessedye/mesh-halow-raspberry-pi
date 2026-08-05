@@ -1902,12 +1902,19 @@ async function nodes(){const d=await j("/api/nodes");
  const banner=d.watcher_stale?`<div class="card"><p class="bad">WATCHER STALE —
   cache is ${d.age_s??"?"}s old (3× the poll interval). A dead watcher must not look
   like a healthy fleet: check /api/logs?unit=halow-watch.</p></div>`:"";
+ const sigc=v=>v==null?"":v>=-65?"ok":v>=-80?"warn":"bad";
  const rows=(d.nodes||[]).map(n=>{
-  const L=n.learned||{},A=n.assoc||{};
+  const L=n.learned||{},A=n.assoc||{},R=n.report||{};
+  const sig=A.signal_dbm!=null
+   ?`<span class="${sigc(A.signal_dbm)}">${A.signal_dbm} dBm</span> <span style="color:var(--dim)">halow</span>`
+   :R.rssi!=null
+   ?`<span class="${sigc(R.rssi)}">${R.rssi} dBm</span> <span style="color:var(--dim)">wifi</span>`
+   :"—";
   return `<tr><td>${esc(n.name)}</td>
    <td class="${scls(n.state)}">${esc(n.state)}</td>
    <td>${esc(n.mac||"—")}</td>
    <td>${A.associated?'<span class="ok">yes</span>':(A.reservation_ip?'reserved':'—')}</td>
+   <td>${sig}</td>
    <td>${L.battery_pct??"—"}</td><td>${L.reboot_count??"—"}</td>
    <td>${n.rtt_ms!=null?n.rtt_ms+"ms":"—"}</td>
    <td>${n.checked_at?Math.max(0,Math.round(Date.now()/1000-n.checked_at))+"s":"—"}</td>
@@ -1923,7 +1930,7 @@ async function nodes(){const d=await j("/api/nodes");
    <button class="act" onclick="adopt('${esc(u.mac)}')">adopt</button></p></div>`).join("");
  return `${banner}<div class="card"><h2>fleet — cached by halow-watch
   (age ${d.age_s??"?"}s · poll every ${d.interval_s??"?"}s · viewers never tax the nodes)</h2>
- <table><tr><th>node</th><th>state</th><th>halow mac</th><th>assoc</th><th>batt</th>
+ <table><tr><th>node</th><th>state</th><th>halow mac</th><th>assoc</th><th>signal</th><th>batt</th>
   <th>reboots</th><th>rtt</th><th>checked</th><th>detail</th><th></th></tr>${rows}</table>
  <p style="color:var(--dim)">states: healthy · stale (rebooted / silent past 3× its own interval)
   · wifi-down (a peer still hears it on LoRa) · down · unknown (alive but odd — auth/rate-limit).
