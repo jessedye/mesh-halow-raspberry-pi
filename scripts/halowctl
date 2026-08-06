@@ -25,11 +25,18 @@ set -euo pipefail
 ENV=/etc/halow/halow.env
 PROFILES=/etc/halow/halow-profiles.json
 CONF=/etc/halow/hostapd_s1g.conf
-[ -f "$ENV" ] || { echo "missing $ENV (copy config/halow.env.example)"; exit 1; }
-# halow.env is root-only (it holds the SAE passphrase) — climb once if needed
-[ -r "$ENV" ] || exec sudo "$0" "$@"
-# shellcheck disable=SC1090
-. "$ENV"
+# restore runs on a fresh card where halow.env does not exist yet — it must
+# skip the env guard/source (it recreates the file). Every other subcommand
+# needs the env and the sudo-climb.
+if [ "${1:-}" = restore ]; then
+  [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+else
+  [ -f "$ENV" ] || { echo "missing $ENV (copy config/halow.env.example)"; exit 1; }
+  # halow.env is root-only (it holds the SAE passphrase) — climb once if needed
+  [ -r "$ENV" ] || exec sudo "$0" "$@"
+  # shellcheck disable=SC1090
+  . "$ENV"
+fi
 
 jqp() { python3 -c "import json,sys;d=json.load(open('$PROFILES'));print($1)"; }
 
@@ -603,6 +610,139 @@ PY
       sed "s/^\t/extra key on device: /; s/^[^ \t]/missing key on device: &/" | grep . && rc=1
     [ $rc -eq 0 ] && echo "no drift"
     exit $rc
+    ;;
+  backup)
+    # Encrypted off-device backup of gateway IDENTITY + operator state.
+    # Passphrase: HALOW_BACKUP_PASSPHRASE env, else stdin (never argv).
+    # Plaintext staging lives in /run (tmpfs) — never the SD.
+    BP=${HALOW_BACKUP_PASSPHRASE:-$(head -c 256)}
+    [ "${#BP}" -ge 12 ] || { echo "passphrase must be at least 12 chars"; exit 1; }
+    SET="etc/halow/halow.env etc/halow/ui.conf etc/halow/nodes.json
+         etc/halow/ui-key.pem etc/halow/ui-cert.pem
+         etc/halow/halow-profiles.json etc/halow/pinned-scan.json
+         etc/halow/nftables-halow.conf etc/halow/forwards.json
+         etc/modprobe.d/morse.conf etc/dnsmasq.d/halow.conf
+         etc/dnsmasq.d/halow-reservations.conf"
+    STG=$(sudo mktemp -d /run/halow-backup.XXXX); sudo chmod 700 "$STG"
+    # collect only files that exist; build the manifest with real modes/owners
+    PRESENT=""
+    for f in $SET; do [ -e "/$f" ] && PRESENT="$PRESENT $f"; done
+    sudo env PRESENT="$PRESENT" DRIVER_TAG=mm6108-2.0.1 python3 - "$STG" <<'PY'
+import hashlib, json, os, pwd, grp, subprocess, sys
+stg = sys.argv[1]
+files = []
+for f in os.environ["PRESENT"].split():
+    p = "/" + f
+    st = os.stat(p)
+    files.append({"path": f,
+                  "sha256": hashlib.sha256(open(p, "rb").read()).hexdigest(),
+                  "mode": oct(st.st_mode & 0o777)[2:].zfill(4),
+                  "owner": f"{pwd.getpwuid(st.st_uid).pw_name}:"
+                           f"{grp.getgrgid(st.st_gid).gr_name}"})
+m = {"format": 1,
+     "created_at": subprocess.run(["date","-Is"],capture_output=True,text=True).stdout.strip(),
+     "hostname": os.uname().nodename, "kernel": os.uname().release,
+     "driver_tag": os.environ["DRIVER_TAG"], "files": files}
+open(os.path.join(stg, "manifest.json"), "w").write(json.dumps(m, indent=1))
+PY
+    sudo sh -c 'cd / && cp --parents -a '"$PRESENT"' "$1"' _ "$STG/" 2>/dev/null
+    OUTDIR=/var/lib/halow/backup
+    sudo mkdir -p "$OUTDIR"; sudo chmod 750 "$OUTDIR"; sudo chgrp halow-ui "$OUTDIR"
+    OUT="$OUTDIR/gateway-backup-$(date +%Y%m%d-%H%M%S).tar.gpg"
+    # tar into the tmpfs staging dir, then gpg with the passphrase on STDIN
+    # (not argv, not a herestring). Plaintext tar lives only in /run tmpfs.
+    sudo sh -c 'cd "$1" && tar -cz manifest.json '"$PRESENT"' > archive.tar.gz' _ "$STG"
+    printf '%s' "$BP" | sudo gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
+      --symmetric --cipher-algo AES256 -o "$OUT" "$STG/archive.tar.gz"
+    sudo rm -rf "$STG"
+    SZ=$(stat -c%s "$OUT")
+    [ "$SZ" -le 1048576 ] || { echo "archive $SZ bytes > 1MB cap — something wrong got included"; sudo rm -f "$OUT"; exit 1; }
+    # test-decrypt so a mistyped passphrase is caught NOW, not at disaster time
+    N=$(printf '%s' "$BP" | sudo gpg --batch --pinentry-mode loopback --passphrase-fd 0 -d "$OUT" 2>/dev/null | tar -tz | wc -l)
+    EXP=$(( $(echo $PRESENT | wc -w) + 1 ))
+    [ "$N" = "$EXP" ] || { echo "test-decrypt FAILED ($N of $EXP members) — passphrase or archive bad"; sudo rm -f "$OUT"; exit 1; }
+    sudo chmod 640 "$OUT"; sudo chgrp halow-ui "$OUT"
+    # retention: keep newest 5
+    sudo sh -c 'ls -1t /var/lib/halow/backup/gateway-backup-*.tar.gpg 2>/dev/null | tail -n +6 | xargs -r rm -f'
+    echo "file=$(basename "$OUT") bytes=$SZ sha256=$(sudo sha256sum "$OUT" | cut -d" " -f1)"
+    ;;
+  restore)
+    # CLI-only (NOT in sudoers). Runs as root; staging in /run (tmpfs).
+    TAR=${2:?usage: halowctl restore <tarball> [--confirm]}
+    CONFIRM=0; [ "${3:-}" = --confirm ] && CONFIRM=1
+    [ -f "$TAR" ] || { echo "no such file: $TAR"; exit 1; }
+    BP=${HALOW_BACKUP_PASSPHRASE:-$(head -c 256)}
+    STG=$(mktemp -d /run/halow-restore.XXXX); chmod 700 "$STG"
+    trap 'rm -rf "$STG"' EXIT
+    if ! printf '%s' "$BP" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 -d "$TAR" 2>/dev/null | tar -C "$STG" -xz; then
+      echo "decrypt/extract failed — wrong passphrase or corrupt archive"; exit 1
+    fi
+    # validate manifest, sha256 every member, reject bad paths, compute diffs.
+    # '|| rc=$?' both captures the code AND stops set -e aborting the script.
+    rc=0
+    env CONFIRM="$CONFIRM" python3 - "$STG" <<'PY' || rc=$?
+import hashlib, json, os, sys
+stg = sys.argv[1]
+try:
+    m = json.load(open(os.path.join(stg, "manifest.json")))
+except Exception as e:
+    sys.exit(f"no valid manifest: {e}")
+if m.get("format") != 1:
+    sys.exit(f"unknown backup format {m.get('format')}")
+differ = []
+for f in m["files"]:
+    p = f["path"]
+    if p.startswith("/") or ".." in p.split("/"):
+        sys.exit(f"unsafe path in archive: {p}")
+    src = os.path.join(stg, p)
+    if not os.path.isfile(src):
+        sys.exit(f"manifest lists {p} but it is missing from the archive")
+    if hashlib.sha256(open(src, "rb").read()).hexdigest() != f["sha256"]:
+        sys.exit(f"sha256 mismatch on {p} — archive corrupt")
+    dst = "/" + p
+    live = (open(dst, "rb").read() if os.path.isfile(dst) else None)
+    if live is None or hashlib.sha256(live).hexdigest() != f["sha256"]:
+        differ.append(p)
+if not differ:
+    print("no changes")
+    sys.exit(3)  # sentinel: idempotent no-op
+if os.environ["CONFIRM"] != "1":
+    sys.stderr.write("REFUSED: these files differ from the archive "
+                     "(re-run with --confirm to overwrite):\n  "
+                     + "\n  ".join(differ) + "\n")
+    sys.exit(2)
+print("\n".join(differ))
+PY
+    # NOTE: no 'rc=$?' here — it would capture the '|| rc=$?' assignment's
+    # own success (0) and clobber the sentinel. rc is already set above.
+    if [ $rc -eq 2 ]; then exit 2; fi              # refused, no --confirm
+    if [ $rc -eq 3 ]; then trap - EXIT; rm -rf "$STG"; exit 0; fi  # no-op
+    [ $rc -eq 0 ] || exit $rc                       # any other failure
+    # install each file atomically with the manifest's mode/owner
+    sudo python3 - "$STG" <<'PY'
+import json, os, shutil, sys, tempfile
+stg = sys.argv[1]
+m = json.load(open(os.path.join(stg, "manifest.json")))
+for f in m["files"]:
+    src, dst = os.path.join(stg, f["path"]), "/" + f["path"]
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    tmp = dst + ".rtmp"
+    shutil.copyfile(src, tmp)
+    os.chmod(tmp, int(f["mode"], 8))
+    u, g = f["owner"].split(":")
+    shutil.chown(tmp, u, g)
+    os.replace(tmp, dst)
+    print("restored", dst)
+PY
+    /usr/local/bin/halowctl gen >/dev/null 2>&1 || true
+    systemctl restart dnsmasq halow-ui 2>/dev/null || true
+    systemctl restart halow-ap 2>/dev/null || true
+    /usr/local/bin/halowctl forwards apply >/dev/null 2>&1 || true
+    trap - EXIT; rm -rf "$STG"
+    echo "restore complete — running verify.sh:"
+    [ -x "$(dirname "$0")/verify.sh" ] && "$(dirname "$0")/verify.sh" || \
+      [ -x /home/pi/mesh-halow-raspberry-pi/scripts/verify.sh ] && \
+      /home/pi/mesh-halow-raspberry-pi/scripts/verify.sh || echo "(verify.sh not found)"
     ;;
   snapshot)
     D=/var/lib/halow/config-snapshot-$(date +%Y%m%d-%H%M%S)

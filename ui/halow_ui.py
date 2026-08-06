@@ -616,6 +616,44 @@ def api_diag_capture_get():
                              "attachment; filename=halow0.pcap"})
 
 
+BACKUP_DIR = "/var/lib/halow/backup"
+
+
+@app.post("/api/system/backup")
+@authed
+def api_system_backup():
+    """Create an encrypted off-device backup. Passphrase (>=12 chars) via
+    the form body over TLS, passed to halowctl on STDIN — never argv,
+    never logged, never echoed back."""
+    pw = request.form.get("passphrase", "")
+    if len(pw) < 12:
+        return jsonify({"error": "passphrase must be at least 12 chars"}), 400
+    ok, out = halowctl(["backup"], stdin=pw, timeout=60)
+    if not ok:
+        return jsonify({"error": out}), 500
+    # parse "file=.. bytes=.. sha256=.." — never surface the passphrase
+    fields = dict(p.split("=", 1) for p in out.split() if "=" in p)
+    return jsonify({"ok": True, "file": fields.get("file"),
+                    "bytes": int(fields.get("bytes", 0)),
+                    "sha256": fields.get("sha256"),
+                    "download": "/api/system/backup"})
+
+
+@app.get("/api/system/backup")
+@authed
+def api_system_backup_get():
+    try:
+        newest = max((os.path.join(BACKUP_DIR, f)
+                      for f in os.listdir(BACKUP_DIR)
+                      if f.endswith(".tar.gpg")), key=os.path.getmtime)
+        data = open(newest, "rb").read()
+    except (OSError, ValueError):
+        return jsonify({"error": "no backup yet"}), 404
+    return Response(data, mimetype="application/octet-stream",
+                    headers={"Content-Disposition":
+                             f"attachment; filename={os.path.basename(newest)}"})
+
+
 @app.post("/api/system/reboot")
 @authed
 def api_system_reboot():
@@ -2075,6 +2113,12 @@ async function config(){const c=await j("/api/config");
  <button class="act" onclick="fwdAdd()">add</button></p></div>
  <div class="card"><h2>System</h2>
  <p><button class="act" onclick="reboot()">reboot gateway</button></p>
+ <p style="border-top:1px solid #21262d;padding-top:8px">encrypted backup —
+ passphrase <input id="bk-pw" type="password" placeholder="≥12 chars" style="width:150px">
+ <button class="act" onclick="doBackup(this)">create</button>
+ <a class="act" href="/api/system/backup" style="text-decoration:none">download latest</a>
+ <span style="color:var(--dim)">identity + operator state, AES256; store the passphrase off-device (a lost passphrase = a dead backup)</span></p>
+ <pre id="bk-out"></pre>
  <p style="color:var(--dim)">API: every change here is also scriptable —
  same endpoints with <code>curl -u user:pass</code> or
  <code>-H "Authorization: Bearer &lt;ADMIN_TOKEN&gt;"</code>.
@@ -2102,6 +2146,14 @@ async function resAdd(){await post("/api/config/reservations",
 async function resDel(m){await post("/api/config/reservations",{op:"del",mac:m})}
 async function reboot(){if(confirm("Reboot the gateway now?"))
  await post("/api/system/reboot",{confirm:1})}
+async function doBackup(btn){const pw=$("#bk-pw").value;
+ if(pw.length<12){$("#bk-out").textContent="passphrase must be ≥12 chars";return}
+ btn.disabled=true;btn.textContent="encrypting…";
+ try{const fd=new FormData();fd.append("passphrase",pw);
+ const r=await(await fetch("/api/system/backup",{method:"POST",body:fd})).json();
+ $("#bk-pw").value="";
+ $("#bk-out").textContent=r.error||`created ${r.file} · ${r.bytes} bytes · sha256 ${r.sha256}\ndownload it off-device now (the SD card is the disaster this survives)`}
+ finally{btn.disabled=false;btn.textContent="create"}}
 async function ovw(){const s=await j("/api/system"),h=await j("/api/halow");
  const t=(parseInt(s.temp)/1000).toFixed(1);
  return `<div class="card"><h2>gateway</h2><div class="grid">

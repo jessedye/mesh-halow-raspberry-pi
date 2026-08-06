@@ -317,7 +317,22 @@ nothing on the v1 rejected list); verifier corrections are folded in.
     once), retry with vip.py-style damping, report which path answered.
     `GET /api/reach`: per-node matrix across LAN IP / HaLow lease /
     firmware VIP, ICMP + HTTP-HEAD-never-bare-connect. [medium/medium]
-27. **Encrypted off-device backup/restore** — snapshot/diff lives on the
+27. **Encrypted off-device backup/restore** — DONE 2026-08-05 (halowctl
+    backup: gpg-symmetric AES256 of identity+operator state, passphrase
+    on stdin, plaintext only in /run tmpfs, 1MB cap, keep-5 retention,
+    test-decrypt at creation [M: 12 files+manifest, 5.5KB]; halowctl
+    restore: /run staging, per-file sha256 + path-whitelist validation,
+    confirm-gate lists differing PATHS only, atomic installs, gen +
+    service restarts + verify.sh. Drilled [M]: decrypt lists the set,
+    wrong passphrase rejected, <12-char refused, retention exactly 5,
+    secret scan 0 hits (SAE psk + archive pw) in ciphertext/journal
+    with a probe-honesty positive control, confirm-gate refuses without
+    --confirm and restores with it, idempotent no-op exits 0 touching no
+    services, API round-trip sha256 matches at the receiver, byte-for-
+    byte identity (live halow.env == manifest). POST/GET /api/system/
+    backup + Config-tab card; restore is CLI-only, never in sudoers.
+    docs/restore-drill.md. The fresh-card + node-rejoin drill awaits a
+    spare SD + station.) — snapshot/diff lives on the
     same SD card whose death is the disaster; profile, SSID, SAE
     passphrase, reservations, forwards, auth hashes, TLS key, node
     tokens exist only there. `halowctl backup` = age/gpg-encrypted
