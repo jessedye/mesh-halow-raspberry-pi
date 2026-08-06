@@ -2250,13 +2250,36 @@ async function meshmap(){_mesh=await j("/api/topology");
   ${_mesh.edges?_mesh.edges.length:0} links${_mesh.age_s!=null?` · ${_mesh.age_s}s old`:""}
   ${_mesh.error?`<span class="warn">${esc(_mesh.error)}</span>`:""}</h2>
  <p style="color:var(--dim)">${leg} — solid = the router's own view (HaLow assoc / WiFi lease /
-  wired); dashed = a node's reported peer (LoRa/ESP-NOW mesh). Hover a link for detail.</p>
- <svg id="mesh-svg" viewBox="0 0 900 520" style="width:100%;height:520px;background:#0d1117;border-radius:8px"></svg>
- <pre id="mesh-detail" style="color:var(--dim)"></pre></div>`}
+  wired); dashed = a node's reported peer (LoRa/ESP-NOW mesh). Each link is labeled with its
+  transport; <b>click a node</b> for its full config. API: <code>/api/topology</code>.</p>
+ <div style="display:flex;gap:12px;flex-wrap:wrap">
+ <svg id="mesh-svg" viewBox="0 0 900 520" style="flex:1;min-width:420px;height:520px;background:#0d1117;border-radius:8px"></svg>
+ <div id="mesh-detail" style="flex:0 0 320px;min-width:260px;background:#0d1117;border-radius:8px;padding:12px;overflow:auto;max-height:520px">
+  <p style="color:var(--dim)">click a node for its configuration, addresses, radios and links</p></div>
+ </div></div>`}
+function nodeDetail(v){
+ const rows=[];
+ const add=(k,x)=>{if(x!=null&&x!=="")rows.push(`<tr><td style="color:var(--dim);padding-right:10px">${esc(k)}</td><td>${x}</td></tr>`)};
+ add("kind",esc(v.kind)+(v.role?` (${esc(v.role)})`:""));
+ add("state",v.state?`<span class="${v.state==='healthy'?'ok':v.state==='down'?'bad':'warn'}">${esc(v.state)}</span>`:null);
+ add("long name",esc(v.long_name));
+ add("mesh id",esc(v.mesh_id));
+ if(v.battery!=null)add("battery",v.battery+"%");
+ if(v.reboot_count!=null)add("reboots",v.reboot_count);
+ if(v.signal_dbm!=null)add("HaLow signal",v.signal_dbm+" dBm");
+ if(v.espnow_ready!=null)add("ESP-NOW",v.espnow_ready?"ready":"not ready");
+ add("transports",(v.transports||[]).map(t=>`<span style="color:${TCOLOR[t]||'#8b949e'}">${esc(t)}</span>`).join(", "));
+ if(v.addrs){for(const[k,a]of Object.entries(v.addrs))if(a)add(k+(v.kind==='gateway'?" (iface)":" addr"),esc(a))}
+ const links=(_mesh.edges||[]).filter(e=>e.from===v.id||e.to===v.id).map(e=>{
+  const other=e.from===v.id?e.to:e.from;
+  return `<tr><td style="color:${TCOLOR[e.transport]||'#8b949e'};padding-right:10px">${esc(e.transport)}</td><td>→ ${esc(other)}<br><span style="color:var(--dim)">${esc(e.detail||'')} · ${esc(e.evidence||'')}</span></td></tr>`}).join("");
+ document.getElementById("mesh-detail").innerHTML=
+  `<h3 style="margin:0 0 8px">${esc(v.label||v.id)}</h3>
+   <table style="font-size:13px">${rows.join("")}</table>
+   ${links?`<h4 style="margin:12px 0 4px;color:var(--dim)">links</h4><table style="font-size:13px">${links}</table>`:""}`}
 function drawMesh(){const svg=$("#mesh-svg");if(!svg||!_mesh||!_mesh.nodes)return;
  const W=900,H=520,V=_mesh.nodes,E=_mesh.edges||[];
  const idx={};V.forEach((v,i)=>idx[v.id]=i);
- // seed: router centre, others on a circle, then a few relaxation passes
  const P=V.map((v,i)=>v.id==="router"?{x:W/2,y:H/2}:
   {x:W/2+260*Math.cos(2*Math.PI*i/V.length),y:H/2+200*Math.sin(2*Math.PI*i/V.length)});
  for(let it=0;it<220;it++){
@@ -2274,14 +2297,19 @@ function drawMesh(){const svg=$("#mesh-svg");if(!svg||!_mesh||!_mesh.nodes)retur
  let s="";
  E.forEach((e,i)=>{const a=P[idx[e.from]],b=P[idx[e.to]];if(!a||!b)return;
   const rev=(e.evidence||"").includes("/api/mesh");
-  s+=`<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${TCOLOR[e.transport]||'#8b949e'}"
+  const mx=(a.x+b.x)/2,my=(a.y+b.y)/2,col=TCOLOR[e.transport]||'#8b949e';
+  s+=`<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${col}"
    stroke-width="2.5"${rev?' stroke-dasharray="6 4"':''} opacity="0.8"
-   onmouseover="document.getElementById('mesh-detail').textContent='${esc(e.from)} — ${esc(e.to)} via ${esc(e.transport)}: ${esc(e.detail||'')} [${esc(e.evidence||'')}]'"/>`});
+   onmouseover="this.setAttribute('stroke-width','4.5')" onmouseout="this.setAttribute('stroke-width','2.5')"><title>${esc(e.from)} — ${esc(e.to)} via ${esc(e.transport)}: ${esc(e.detail||'')} [${esc(e.evidence||'')}]</title></line>`;
+  // transport label on the edge, on a small dark plate so it stays legible
+  s+=`<rect x="${mx-esc(e.transport).length*3.5-3}" y="${my-8}" width="${esc(e.transport).length*7+6}" height="15" rx="3" fill="#0d1117" opacity="0.85"/>
+   <text x="${mx}" y="${my+3}" fill="${col}" font-size="11" text-anchor="middle">${esc(e.transport)}</text>`});
  V.forEach((v,i)=>{const p=P[i],r=v.kind==="gateway"?26:v.kind==="heard"?12:18;
   const fill=v.kind==="gateway"?"#1f6feb":v.kind==="heard"?"#30363d":"#21262d";
   const batt=v.battery!=null?` ${v.battery}%`:"";
-  s+=`<circle cx="${p.x}" cy="${p.y}" r="${r}" fill="${fill}" stroke="${scls(v.state)}" stroke-width="2.5"/>
-   <text x="${p.x}" y="${p.y+r+14}" fill="#c9d1d9" font-size="12" text-anchor="middle">${esc(v.label||v.id)}${esc(batt)}</text>`});
+  s+=`<circle cx="${p.x}" cy="${p.y}" r="${r}" fill="${fill}" stroke="${scls(v.state)}" stroke-width="2.5"
+   style="cursor:pointer" onclick="nodeDetail(_mesh.nodes[${i}])"><title>click for detail</title></circle>
+   <text x="${p.x}" y="${p.y+r+14}" fill="#c9d1d9" font-size="12" text-anchor="middle" style="cursor:pointer" onclick="nodeDetail(_mesh.nodes[${i}])">${esc(v.label||v.id)}${esc(batt)}</text>`});
  svg.innerHTML=s}
 async function roleOp(op,confirm){const fd=new FormData();fd.append("op",op);
  if(confirm)fd.append("confirm","1");

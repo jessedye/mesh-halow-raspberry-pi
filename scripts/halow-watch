@@ -369,14 +369,42 @@ def poll_cycle(states, cfg, now):
     return out_nodes, unknown
 
 
+def local_ifaces():
+    """The router's own interface addresses (unprivileged)."""
+    out = {}
+    try:
+        raw = subprocess.run(["ip", "-j", "addr"], capture_output=True,
+                             text=True, timeout=5).stdout
+        for i in json.loads(raw or "[]"):
+            v4 = [a["local"] for a in i.get("addr_info", [])
+                  if a.get("family") == "inet"]
+            if v4 and i["ifname"] != "lo":
+                out[i["ifname"]] = v4[0]
+    except Exception:
+        pass
+    return out
+
+
 def build_topology(states, nodes, signals, leases, reservations, now):
     """Unified mesh graph from every evidence source. Vertices: the router
     + each managed node + any meshtastic id a node hears but we don't
     manage. Edges: router<->node (halow assoc / wlan lease / LAN url,
     gateway-side evidence) and node<->node (each node's /api/mesh edges,
-    LoRa/ESP-NOW). Node ids are correlated to names via learned mesh_names."""
+    LoRa/ESP-NOW). Node ids are correlated to names via learned mesh_names.
+    Every vertex carries the detail the console's click panel + API want."""
+    try:
+        addrs = json.load(open(os.path.join(STATE_DIR, "node-addrs.json")))
+    except Exception:
+        addrs = {}
+    try:
+        role = next((l.split("=", 1)[1].strip() for l in open(ENVF)
+                     if l.startswith("HALOW_ROLE=")), "gateway")
+    except OSError:
+        role = "gateway"
+    ifaces = local_ifaces()
     verts = {"router": {"id": "router", "label": "halow-gw",
-                        "kind": "gateway", "transports": ["ethernet"]}}
+                        "kind": "gateway", "role": role,
+                        "addrs": ifaces, "transports": ["ethernet"]}}
     id_to_name = {}   # meshtastic id -> our node name
     for n in nodes:
         name = n.get("name", "?")
@@ -385,12 +413,20 @@ def build_topology(states, nodes, signals, leases, reservations, now):
         mid = learned.get("id")
         if mid:
             id_to_name[mid] = name
+        mac = (n.get("mac") or "").lower()
+        na = addrs.get(name, {})
         verts[name] = {
             "id": name, "label": name, "kind": "node",
             "mesh_id": mid, "long_name": learned.get("long_name"),
             "battery": learned.get("battery_pct"),
-            "state": next((o["state"] for o in []), None),
-            "transports": []}
+            "reboot_count": learned.get("reboot_count"),
+            "espnow_ready": learned.get("espnow_ready"),
+            "signal_dbm": signals.get(mac),
+            "addrs": {"lan": n.get("url", "").split("://", 1)[-1]
+                      .split("/", 1)[0], "halow": leases.get(mac, {}).get("ip"),
+                      "reservation": reservations.get(mac, {}).get("ip"),
+                      "lora": na.get("lora"), "fwvip": na.get("fwvip")},
+            "state": None, "transports": []}
     edges = []
     seen_edge = set()
 
