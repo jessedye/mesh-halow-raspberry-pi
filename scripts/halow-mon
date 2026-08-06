@@ -269,6 +269,19 @@ def presence_step(parsed, now):
                 pass
     except OSError:
         pass
+    # a trail-cam frame (roadmap 29) is application-level proof of life,
+    # keyed by X-Node-Id == the nodes.json name (the #16 correlation rule)
+    last_image = {}
+    try:
+        for line in open("/var/lib/halow/images/index.jsonl"):
+            try:
+                r = json.loads(line)
+                if r.get("received_at", 0) > last_image.get(r.get("node"), 0):
+                    last_image[r["node"]] = r["received_at"]
+            except Exception:
+                pass
+    except OSError:
+        pass
     frames = {e["mac"]: now - e.get("inactive_ms", 0) / 1000.0
               for e in parsed if "inactive_ms" in e}
     assoc = {e["mac"] for e in parsed}
@@ -312,15 +325,18 @@ def presence_step(parsed, now):
         ci = last_checkin.get(name)
         if ci:
             ev["checkin"] = ci["t"]
+        if name in last_image:
+            ev["image"] = last_image[name]
         if mac in frames:
             ev["frames"] = int(frames[mac])
         if mac in leases:
             ev["lease~"] = leases[mac]
         if mac in joins:
             ev["join"] = int(joins[mac])
-        # best evidence: most-trusted source first
+        # best evidence: most-trusted source first (checkin and image are
+        # both application pushes; frames is link-level; lease~ approximate)
         best_src, best_t = None, 0
-        for src in ("checkin", "frames", "lease~", "join"):
+        for src in ("checkin", "image", "frames", "lease~", "join"):
             if src in ev and ev[src] > best_t:
                 best_src, best_t = src, ev[src]
         associated = mac in assoc
