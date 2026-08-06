@@ -256,6 +256,15 @@ def poll_cycle(states, cfg, now):
                 flatten(body, flat)
                 entry["report"] = {k: flat[k] for k in REPORT_FIELDS
                                    if k in flat}
+                # how is this node actually connected to the LAN? it
+                # reports its own wifi (ESP32 nodes have no wired eth), so
+                # the router<->node LAN edge is WiFi, not ethernet
+                wifi = body.get("data", body).get("wifi", {})
+                if wifi.get("rssi") is not None:
+                    st.learned["wifi_rssi"] = wifi.get("rssi")
+                    st.learned["wifi_ssid"] = wifi.get("ssid")
+                else:
+                    st.learned["wifi_rssi"] = None
             else:
                 state = "unknown"
                 detail = f"report answered {status} without usable JSON"
@@ -278,8 +287,12 @@ def poll_cycle(states, cfg, now):
                 st.fails += 1
                 st.skip = 2 ** min(st.fails, 3)
 
-        # deep poll: first sight or every Nth successful cycle
-        if state == "healthy" and (not st.learned
+        # deep poll: first sight or every Nth successful cycle. Key
+        # "never deep-polled" on the mesh id (set ONLY by the deep poll),
+        # not on st.learned being empty — the cheap path now writes
+        # wifi_rssi into learned, which would otherwise suppress the
+        # first-sight deep poll and never capture the mesh edges.
+        if state == "healthy" and (not st.learned.get("id")
                                    or st.cycles % cfg["diag_every"] == 0):
             try:
                 _, diag = fetch(n["url"] + "/api/diag", n.get("token"))
@@ -455,11 +468,21 @@ def build_topology(states, nodes, signals, leases, reservations, now):
         if mac and leases.get(mac, {}).get("ip", "").startswith("10.42."):
             add_edge("router", name, "wifi",
                      leases[mac]["ip"], "wlan0 lease")
-        # LAN url on the wired side
+        # the node's LAN reachability, labeled by how the NODE actually
+        # connects: it reports its own wifi rssi (ESP32 nodes have no
+        # wired ethernet), so this is a WiFi link, not ethernet. Only a
+        # node with no wifi evidence at all falls back to "ethernet".
         host = n.get("url", "").split("://", 1)[-1].split("/", 1)[0]\
             .split(":", 1)[0]
-        if host.startswith(("192.168.50.", "192.168.51.")):
-            add_edge("router", name, "ethernet", host, "nodes.json url")
+        if host.startswith(("192.168.50.", "192.168.51.", "10.")):
+            st = states.get(name)
+            wr = (st.learned.get("wifi_rssi") if st else None)
+            if wr is not None:
+                ssid = (st.learned.get("wifi_ssid") or "").strip()
+                det = f"{host} · {wr} dBm" + (f" · {ssid}" if ssid else "")
+                add_edge("router", name, "wifi", det, "node /json/report")
+            else:
+                add_edge("router", name, "ethernet", host, "nodes.json url")
 
     # node <-> node, from each node's mesh peer graph
     for n in nodes:
