@@ -57,6 +57,86 @@ app.config.update(
 )
 
 
+# ---------- trail-cam ingest sink (roadmap 29) ----------
+# Terminal sink: a camera POSTs, the operator GETs, nothing else moves
+# (store-and-forward stays rejected). Runs as halow-ui; /var/lib/halow is
+# already service-owned. sha256-verified on receipt, both-caps bounded ring.
+import re as _ire
+import threading as _threading
+IMAGES_DIR = "/var/lib/halow/images"
+IMAGES_INDEX = os.path.join(IMAGES_DIR, "index.jsonl")
+IMAGE_ID_RE = _ire.compile(
+    r"^[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9-]{1,32}-[0-9]{6}-[0-9a-f]{8}\.jpg$")
+_ingest_lock = _threading.Lock()
+_ingest_rate = {}   # ip -> [timestamps within the 60s window]
+os.makedirs(IMAGES_DIR, exist_ok=True)
+
+
+def _ingest_conf():
+    e = load_kv(ENV_CONF)
+    def g(k, d):
+        try:
+            return int(e.get(k) or d)
+        except ValueError:
+            return d
+    return {"max_bytes": g("INGEST_MAX_BYTES", 4194304),
+            "ring_count": g("INGEST_RING_COUNT", 2000),
+            "ring_mb": g("INGEST_RING_MB", 256),
+            "min_free_mb": g("INGEST_MIN_FREE_MB", 512),
+            "rate_per_min": g("INGEST_RATE_PER_MIN", 60)}
+
+
+def _ring_load():
+    """Index records; reconcile against the directory (a brownout
+    mid-eviction leaves them disagreeing — rebuild from filenames, which
+    carry all metadata by design)."""
+    recs, seen = [], set()
+    try:
+        for line in open(IMAGES_INDEX):
+            try:
+                r = json.loads(line)
+                if os.path.isfile(os.path.join(IMAGES_DIR, r["id"])):
+                    recs.append(r)
+                    seen.add(r["id"])
+            except Exception:
+                pass
+    except OSError:
+        pass
+    on_disk = {f for f in os.listdir(IMAGES_DIR) if IMAGE_ID_RE.match(f)}
+    if on_disk - seen:   # files with no index row — rebuild those from name
+        for fid in on_disk - seen:
+            parts = fid[:-4].split("-")
+            ts, node, seq, _sh = parts[0], "-".join(parts[1:-2]), \
+                parts[-2], parts[-1]
+            try:
+                st = os.stat(os.path.join(IMAGES_DIR, fid))
+                recs.append({"id": fid, "node": node,
+                             "seq": int(seq) if seq != "000000" else None,
+                             "bytes": st.st_size, "sha256": None,
+                             "received_at": int(st.st_mtime),
+                             "claimed_ts": None})
+            except OSError:
+                pass
+    recs.sort(key=lambda r: r["received_at"])
+    return recs
+
+
+def _ring_write_index(recs):
+    tmp = IMAGES_INDEX + ".tmp"
+    with open(tmp, "w") as f:
+        for r in recs:
+            f.write(json.dumps(r) + "\n")
+    os.replace(tmp, IMAGES_INDEX)   # atomic — the #22 convention
+
+
+def _ring_stats(recs, conf):
+    total = sum(r["bytes"] for r in recs)
+    vfs = os.statvfs(IMAGES_DIR)
+    return {"count": len(recs), "bytes": total,
+            "cap_count": conf["ring_count"], "cap_mb": conf["ring_mb"],
+            "free_mb": vfs.f_bavail * vfs.f_frsize // 1048576}
+
+
 def _sd_notify(msg):
     """Pure-Python sd_notify: AF_UNIX datagram to $NOTIFY_SOCKET (with the
     abstract-namespace @ prefix). No-op without the env var, so running
@@ -660,6 +740,151 @@ def api_system_backup_get():
     return Response(data, mimetype="application/octet-stream",
                     headers={"Content-Disposition":
                              f"attachment; filename={os.path.basename(newest)}"})
+
+
+@app.post("/api/ingest/image")
+@authed
+def api_ingest_image():
+    """Raw JPEG upload, sha256-verified on receipt. Distinct codes so the
+    node can classify: 400 built-wrong, 413 too big, 415 not JPEG, 422
+    corrupted-in-flight (retry), 429 rate, 507 disk floor. Nothing stored
+    on any non-200. NEVER logs the Authorization header."""
+    import hashlib as _h
+    conf = _ingest_conf()
+    ip = request.remote_addr
+    now = time.time()
+    # rate window (429)
+    win = [t for t in _ingest_rate.get(ip, []) if now - t < 60]
+    if len(win) >= conf["rate_per_min"]:
+        _ingest_rate[ip] = win
+        return jsonify({"error": "rate limited",
+                        "retry_after_s": max(1, int(60 - (now - win[0])))}), 429
+    win.append(now)
+    _ingest_rate[ip] = win
+    # metadata: headers win, query params fall back
+    def meta(hdr, qp):
+        return request.headers.get(hdr) or request.args.get(qp)
+    sha_hdr = (meta("X-SHA256", "sha") or "").lower()
+    if not _ire.fullmatch(r"[0-9a-f]{64}", sha_hdr):
+        return jsonify({"error": "missing or malformed X-SHA256 "
+                        "(64 lowercase hex)"}), 400
+    node = meta("X-Node-Id", "node") or "unknown"
+    if not _ire.fullmatch(r"[A-Za-z0-9-]{1,32}", node):
+        return jsonify({"error": "bad node id ([A-Za-z0-9-]{1,32})"}), 400
+    seq_raw = meta("X-Sequence", "seq")
+    seq = None
+    if seq_raw is not None and seq_raw != "":
+        if not seq_raw.isdigit() or int(seq_raw) > 4294967295:
+            return jsonify({"error": "bad sequence (0..4294967295)"}), 400
+        seq = int(seq_raw)
+    ts_raw = meta("X-Timestamp", "ts")
+    claimed_ts = int(ts_raw) if ts_raw and ts_raw.isdigit() else None
+    # body cap: fast reject on content-length, real guard on the stream
+    if request.content_length and request.content_length > conf["max_bytes"]:
+        return jsonify({"error": "body exceeds cap",
+                        "cap_bytes": conf["max_bytes"]}), 413
+    data = request.stream.read(conf["max_bytes"] + 1)
+    if len(data) > conf["max_bytes"]:
+        return jsonify({"error": "body exceeds cap",
+                        "cap_bytes": conf["max_bytes"]}), 413
+    if not data:
+        return jsonify({"error": "empty body"}), 400
+    if data[:2] != b"\xff\xd8":
+        return jsonify({"error": "not a JPEG (no FF D8 SOI)"}), 415
+    got = _h.sha256(data).hexdigest()
+    if got != sha_hdr:
+        return jsonify({"error": "sha256 mismatch", "header_sha256": sha_hdr,
+                        "received_sha256": got, "bytes": len(data)}), 422
+    vfs = os.statvfs(IMAGES_DIR)
+    free_mb = vfs.f_bavail * vfs.f_frsize // 1048576
+    if free_mb < conf["min_free_mb"]:
+        return jsonify({"error": "disk below floor", "free_mb": free_mb,
+                        "floor_mb": conf["min_free_mb"]}), 507
+    with _ingest_lock:
+        recs = _ring_load()
+        # idempotent retry: same node+seq+digest already stored
+        for r in recs:
+            if (r.get("sha256") == got and r.get("node") == node
+                    and r.get("seq") == seq):
+                return jsonify({"ok": True, "id": r["id"], "bytes": r["bytes"],
+                                "sha256": got, "duplicate": True, "evicted": 0,
+                                "ring": _ring_stats(recs, conf)})
+        fid = (f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{node}-"
+               f"{(seq if seq is not None else 0):06d}-{got[:8]}.jpg")
+        with open(os.path.join(IMAGES_DIR, fid), "wb") as f:
+            f.write(data)
+        rec = {"id": fid, "node": node, "seq": seq, "bytes": len(data),
+               "sha256": got, "received_at": int(now),
+               "claimed_ts": claimed_ts}
+        recs.append(rec)
+        # evict oldest until BOTH caps hold
+        evicted = 0
+        while (len(recs) > conf["ring_count"]
+               or sum(r["bytes"] for r in recs) > conf["ring_mb"] * 1048576):
+            old = recs.pop(0)
+            try:
+                os.remove(os.path.join(IMAGES_DIR, old["id"]))
+            except OSError:
+                pass
+            evicted += 1
+        _ring_write_index(recs)
+        return jsonify({"ok": True, "id": fid, "bytes": len(data),
+                        "sha256": got, "duplicate": False, "evicted": evicted,
+                        "ring": _ring_stats(recs, conf)})
+
+
+@app.get("/api/ingest/images")
+@authed
+def api_ingest_list():
+    conf = _ingest_conf()
+    with _ingest_lock:
+        recs = _ring_load()
+    node_f = request.args.get("node")
+    n = min(int(request.args.get("n", "50")), 500)
+    view = [r for r in recs if not node_f or r.get("node") == node_f]
+    view = list(reversed(view))[:n]
+    # per-node receiver-side accounting — seq_gaps is the number the
+    # sender cannot lie about
+    nodes = {}
+    for name in {r.get("node") for r in recs}:
+        seqs = sorted(r["seq"] for r in recs
+                      if r.get("node") == name and r.get("seq") is not None)
+        gaps = sum(seqs[i + 1] - seqs[i] - 1 for i in range(len(seqs) - 1)) \
+            if len(seqs) > 1 else 0
+        nodes[name] = {"frames": sum(1 for r in recs if r.get("node") == name),
+                       "last_seq": seqs[-1] if seqs else None,
+                       "seq_gaps": gaps}
+    return jsonify({"images": view, "ring": _ring_stats(recs, conf),
+                    "nodes": nodes})
+
+
+@app.get("/api/ingest/images/<img_id>")
+@authed
+def api_ingest_get(img_id):
+    if not IMAGE_ID_RE.match(img_id):   # regex-then-join: the traversal guard
+        return jsonify({"error": "bad image id"}), 400
+    try:
+        data = open(os.path.join(IMAGES_DIR, img_id), "rb").read()
+    except OSError:
+        return jsonify({"error": "no such image"}), 404
+    return Response(data, mimetype="image/jpeg",
+                    headers={"Cache-Control":
+                             "private, max-age=31536000, immutable"})
+
+
+@app.post("/api/ingest/purge")
+@authed
+def api_ingest_purge():
+    if request.form.get("confirm") != "1":
+        return jsonify({"error": "needs confirm=1: empties the frame ring"}), 400
+    with _ingest_lock:
+        for r in _ring_load():
+            try:
+                os.remove(os.path.join(IMAGES_DIR, r["id"]))
+            except OSError:
+                pass
+        _ring_write_index([])
+    return jsonify({"ok": True, "output": "ring purged"})
 
 
 @app.post("/api/system/reboot")
@@ -1968,7 +2193,7 @@ border-radius:6px;padding:5px 8px;font:inherit;width:110px}
 <a href="/logout" style="color:var(--dim);margin-left:14px;text-decoration:none">logout</a></header>
 <main id="main"></main>
 <script>
-const TABS=["Overview","HaLow","Router","Config","Nodes","Map","Diag","Debug"];let tab="Overview";
+const TABS=["Overview","HaLow","Router","Config","Nodes","Map","Camera","Diag","Debug"];let tab="Overview";
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 async function j(u,opt){const r=await fetch(u,opt);if(!r.ok)throw new Error(r.status);return r.json()}
@@ -1982,6 +2207,7 @@ async function render(){nav();const m=$("#main");m.innerHTML="<p class='warn'>lo
  else if(tab==="Debug")m.innerHTML=await debug();
  else if(tab==="Diag")m.innerHTML=await diag();
  else if(tab==="Map"){m.innerHTML=await meshmap();drawMesh()}
+ else if(tab==="Camera")m.innerHTML=await camera();
  else m.innerHTML=await nodes();}catch(e){m.innerHTML=`<p class="bad">${esc(e)}</p>`}}
 async function diag(){const nb=await j("/api/diag/neigh"),sv=await j("/api/diag/survey"),pw=await j("/api/diag/power");
  let bo={count:0,active:false};try{bo=await j("/api/diag/brownouts")}catch(e){}
@@ -2394,6 +2620,27 @@ function drawMesh(){const svg=$("#mesh-svg");if(!svg||!_mesh||!_mesh.nodes)retur
    style="cursor:pointer" onclick="nodeDetail(_mesh.nodes[${i}])"><title>click for detail</title></circle>
    <text x="${p.x}" y="${p.y+r+14}" fill="#c9d1d9" font-size="12" text-anchor="middle" style="cursor:pointer" onclick="nodeDetail(_mesh.nodes[${i}])">${esc(v.label||v.id)}${esc(batt)}</text>`});
  svg.innerHTML=s}
+async function camera(){const d=await j("/api/ingest/images?n=24");
+ const R=d.ring||{};
+ const nrows=Object.entries(d.nodes||{}).map(([n,s])=>
+  `<tr><td>${esc(n)}</td><td>${s.frames}</td><td>${s.last_seq??"—"}</td>
+   <td class="${s.seq_gaps>0?'warn':'ok'}">${s.seq_gaps}</td></tr>`).join("")
+  ||`<tr><td colspan=4 class="warn">no frames yet</td></tr>`;
+ const grid=(d.images||[]).map(im=>
+  `<div style="display:inline-block;margin:4px;text-align:center;vertical-align:top">
+   <img src="/api/ingest/images/${esc(im.id)}" loading="lazy" style="max-width:180px;max-height:180px;border-radius:4px;background:#0d1117">
+   <div style="color:var(--dim);font-size:11px">${esc(im.node)} #${im.seq??"—"}<br>${new Date(im.received_at*1000).toISOString().slice(5,19).replace("T"," ")} · ${im.bytes}B</div></div>`).join("")
+  ||`<p class="warn">no frames — POST a JPEG to /api/ingest/image (contract: docs/feature-roadmap.md item 29)</p>`;
+ return `<div class="card"><h2>trail-cam ingest — ${R.count??0}/${R.cap_count??"?"} frames ·
+  ${Math.round((R.bytes||0)/1048576)} of ${R.cap_mb??"?"} MB · ${R.free_mb??"?"} MB free</h2>
+ <table><tr><th>node</th><th>frames</th><th>last seq</th><th>seq gaps (rx-side)</th></tr>${nrows}</table>
+ <p><button class="act" onclick="camPurge()">purge ring</button>
+ <span style="color:var(--dim)">terminal sink — sha256-verified on receipt, oldest evicted at the caps.
+ seq_gaps is measured receiver-side loss (the sender cannot lie about it).</span></p></div>
+ <div class="card"><h2>latest ${(d.images||[]).length} frames</h2>${grid}</div>`}
+async function camPurge(){if(!confirm("Empty the entire frame ring?"))return;
+ const fd=new FormData();fd.append("confirm","1");
+ await fetch("/api/ingest/purge",{method:"POST",body:fd});render()}
 async function roleOp(op,confirm){const fd=new FormData();fd.append("op",op);
  if(confirm)fd.append("confirm","1");
  const r=await(await fetch("/api/config/role",{method:"POST",body:fd})).json();

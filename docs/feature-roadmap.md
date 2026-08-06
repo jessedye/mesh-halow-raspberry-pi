@@ -368,7 +368,20 @@ nothing on the v1 rejected list); verifier corrections are folded in.
     deauth REASON log parsed from the hostapd journal (the action-script
     hook never sees reason codes), per-STA PS state in /api/halow/link.
     [small/medium]
-29. **Trail-cam image ingest sink** — terminal destination for frames:
+29. **Trail-cam image ingest sink** — MACHINERY DONE 2026-08-05 (POST
+    /api/ingest/image: sha256-verified on receipt with DISTINCT codes —
+    200/400/413/415/422/429/507 — so the node classifies built-wrong vs
+    corrupted-in-flight vs too-big; both-caps bounded ring, oldest
+    evicted, disk floor, per-source rate limit, atomic index. GET list
+    (newest-first + per-node seq_gaps receiver-side loss) + download
+    (immutable-cached) + purge (confirm=1). Camera tab gallery,
+    halowctl images, zero sudoers/root. Drilled [M]: happy path
+    receiver-re-hashed, real corruption -> 422 with both digests,
+    contract errors -> 400, oversize -> 413, non-JPEG -> 415, idempotent
+    dup -> 200, eviction to exactly the cap, seq 1,2,4,7 -> 3 gaps
+    (missing 3/5/6), purge gate, no auth headers in journal. The wire
+    contract is the node-side spec. First-frame-over-HaLow [M] awaits a
+    station.) — terminal destination for frames:
     authenticated HTTPS POST (raw JPEG + sha256 verified on receipt),
     bounded on-disk ring under /var/lib/halow (capture.pcap-style cap),
     list/download API + simple gallery. Terminal sink for the operator,

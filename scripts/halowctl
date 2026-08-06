@@ -10,6 +10,7 @@
 #   halowctl stations          associated STA dump
 #   halowctl join-log [mac|--all|--selftest]  association forensics (read-only)
 #   halowctl health            station health ladder view (read-only)
+#   halowctl images            trail-cam ring summary (read-only)
 #   halowctl driver status|rebuild [KVER]|hold|unhold  kernel-upgrade interlock
 #   halowctl role show|check|set-gateway|set-bridge [uplink=halow|wifi] [eth=mgmt|downlink] [hold=N]|commit  bridged mode
 #   halowctl mode ap|sta       broadcast the SSID, or join it as a station
@@ -515,6 +516,36 @@ PY
       unhold)  sudo /usr/local/bin/halow-kernel-guard unhold ;;
       *) echo "usage: halowctl driver status|rebuild [KVER]|hold|unhold"; exit 1 ;;
     esac
+    ;;
+  images)
+    # read-only trail-cam ring summary (world-readable 0644 files); not
+    # in sudoers, never called by the UI
+    python3 - <<'PY'
+import json, os
+d = "/var/lib/halow/images"
+try:
+    files = [f for f in os.listdir(d) if f.endswith(".jpg")]
+except OSError:
+    print("no images dir"); raise SystemExit(0)
+recs = []
+try:
+    for line in open(os.path.join(d, "index.jsonl")):
+        try: recs.append(json.loads(line))
+        except Exception: pass
+except OSError:
+    pass
+total = sum(r.get("bytes", 0) for r in recs)
+print(f"frames: {len(files)}  index rows: {len(recs)}  bytes: {total} "
+      f"({total//1048576} MB)")
+if recs:
+    print("newest:", max(recs, key=lambda r: r.get("received_at", 0))["id"])
+by = {}
+for r in recs:
+    by.setdefault(r.get("node", "?"), 0)
+    by[r["node"]] = by.get(r["node"], 0) + 1
+for n, c in sorted(by.items()):
+    print(f"  {n}: {c} frames")
+PY
     ;;
   health)
     python3 - <<'PY'
