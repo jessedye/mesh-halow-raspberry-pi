@@ -742,6 +742,112 @@ def api_system_backup_get():
                              f"attachment; filename={os.path.basename(newest)}"})
 
 
+CHECKIN_LOG = "/var/lib/halow/checkins.jsonl"
+PRESENCE_JSON = "/var/lib/halow/presence.json"
+CHECKIN_CONTRACT = {
+    "url": "https://10.117.0.1:8443/api/checkin",
+    "auth": "Bearer CHECKIN_TOKEN", "max_body_bytes": 2048,
+    "fields": {"node": "required", "uptime_s": "optional",
+               "batt_mv": "optional", "pos": "optional {lat,lon,alt_m}"}}
+
+
+@app.post("/api/checkin")
+def api_checkin():
+    """Push check-in receiver — the proven pattern (polling remote nodes
+    timed out at 240s; nodes push on a schedule). Cheap for the node: one
+    small POST, a SEPARATE token (not the admin bearer — proving liveness
+    must not require a credential that can rewrite the SSID), 2xx
+    fast-path, no subprocess. Receipt time is authoritative (a node may
+    have no clock). NEVER logs or echoes the token."""
+    conf = load_kv(UI_CONF)
+    want = conf.get("CHECKIN_TOKEN_HASH", "")
+    ip = request.remote_addr
+    if _throttled(ip):
+        return jsonify({"error": "too many failures"}), 401
+    hdr = request.headers.get("Authorization", "")
+    ok = False
+    if want and hdr.startswith("Bearer "):
+        got = hashlib.sha256(hdr[7:].strip().encode()).hexdigest()
+        ok = hmac.compare_digest(got, want)
+    if ok:
+        _auth_ok(ip)
+    else:
+        # admin auth is a superset (curl testing); check_auth owns its own
+        # failure counting, so DON'T _auth_fail again here (double-count
+        # throttles honest clients)
+        ok = session.get("authed") or check_auth(hdr)
+    if not ok:
+        if not want and not hdr:
+            return jsonify({"error": "check-in not configured "
+                            "(CHECKIN_TOKEN_HASH unset)"}), 503
+        return jsonify({"error": "auth required"}), 401
+    if request.content_length and request.content_length > 2048:
+        return jsonify({"error": "body exceeds 2048 bytes"}), 413
+    try:
+        body = json.loads(request.stream.read(2049))
+    except Exception:
+        return jsonify({"error": "bad JSON"}), 400
+    node = body.get("node")
+    if not isinstance(node, str) or not (1 <= len(node) <= 32):
+        return jsonify({"error": "missing or bad 'node'"}), 400
+    # whitelist ONLY — a node bug can never push junk/secrets into the ledger
+    rec = {"t": int(time.time()), "node": node, "src": ip}
+    if isinstance(body.get("uptime_s"), int):
+        rec["uptime_s"] = body["uptime_s"]
+    if isinstance(body.get("batt_mv"), int):
+        rec["batt_mv"] = body["batt_mv"]
+    p = body.get("pos")
+    if isinstance(p, dict):
+        rec["pos"] = {k: p[k] for k in ("lat", "lon", "alt_m")
+                      if isinstance(p.get(k), (int, float))}
+    registered = False
+    try:
+        registered = any(n.get("name") == node for n in
+                         json.load(open(NODES_CONF)).get("nodes", []))
+    except Exception:
+        pass
+    rec["registered"] = registered
+    with open(CHECKIN_LOG, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    try:
+        lines = open(CHECKIN_LOG).readlines()
+        if len(lines) > 5960:
+            tmp = CHECKIN_LOG + ".tmp"
+            open(tmp, "w").writelines(lines[-5760:])
+            os.replace(tmp, CHECKIN_LOG)
+    except OSError:
+        pass
+    return jsonify({"ok": True, "t": rec["t"], "registered": registered})
+
+
+@app.get("/api/presence")
+@authed
+def api_presence():
+    try:
+        pres = json.load(open(PRESENCE_JSON))
+    except Exception:
+        pres = {"t": 0, "nodes": {}, "unlisted": []}
+    # battery trend per node from checkins (>=5 samples in 24h: a slope
+    # means something, one low reading is noise — the nodewatch rule)
+    cutoff = time.time() - 86400
+    batt = {}
+    try:
+        for line in open(CHECKIN_LOG):
+            try:
+                r = json.loads(line)
+                if r.get("t", 0) >= cutoff and "batt_mv" in r:
+                    batt.setdefault(r["node"], []).append(r["batt_mv"])
+            except Exception:
+                pass
+    except OSError:
+        pass
+    for name, mv in batt.items():
+        if len(mv) >= 5 and name in pres.get("nodes", {}):
+            pres["nodes"][name]["batt_mv_trend"] = mv[-1] - mv[0]
+    pres["checkin_contract"] = CHECKIN_CONTRACT
+    return jsonify(pres)
+
+
 @app.post("/api/ingest/image")
 @authed
 def api_ingest_image():
@@ -2427,7 +2533,19 @@ async function ovw(){const s=await j("/api/system"),h=await j("/api/halow");
  `next-boot kernel ${esc(s.kernel_guard.next_boot_kernel||"?")} module=${s.kernel_guard.next_boot_has_module} · running ${esc(s.kernel_guard.running_kernel||"?")} module=${s.kernel_guard.running_has_module} — a reboot in this state kills the AP`}</p>
  <p><button class="act" onclick="drvRebuild(this)">rebuild driver</button></p><pre id="drv-out"></pre></div>`:""}
  <div class="card"><h2>kernel / disk</h2><pre>${esc(s.kernel)}  root <span class="${s.disk.low?'bad':'ok'}">${s.disk.free_mb} MB free</span> of ${s.disk.total_mb} MB (${s.disk.used_pct}% used)${s.disk.low?' — BELOW '+s.disk.low_water_mb+' MB LOW-WATER':''}</pre></div>
- ${await monCard()}`}
+ ${await presenceCard()}${await monCard()}`}
+async function presenceCard(){try{const p=await j("/api/presence");
+ const nodes=Object.entries(p.nodes||{});
+ if(!nodes.length)return `<div class="card"><h2>presence</h2><p style="color:var(--dim)">no nodes on the check-in contract (set mac + expected_interval_s in nodes.json). POST /api/checkin to prove liveness.</p></div>`;
+ const cls=st=>st==="fresh"?"ok":st==="overdue-associated"?"warn":st==="overdue-absent"?"bad":"dim";
+ const chips=nodes.map(([n,d])=>{
+  const le=d.last_evidence;
+  return `<div class="stat"><div class="v ${cls(d.state)}">${esc(d.state)}</div>
+   <div class="k">${esc(n)}${le?` · ${esc(le.source)}+${le.age_s}s`:""}${d.batt_mv_trend!=null?` · batt ${d.batt_mv_trend>0?"+":""}${d.batt_mv_trend}mV/24h`:""}${d.missed_total?` · ${d.missed_total} missed`:""}</div></div>`}).join("");
+ return `<div class="card"><h2>presence — expected-interval adherence</h2>
+ <div class="grid">${chips}</div>
+ <p style="color:var(--dim)">fresh = heard within 3× its interval · overdue-associated = link up, app silent (node software) · overdue-absent = silent everywhere (RF/power). POST /api/checkin to check in.</p></div>`}
+ catch(e){return ""}}
 async function monCard(){try{const m=await j("/api/metrics?minutes=1440");
  if(!m.n)return `<div class="card"><h2>monitor (24h)</h2><p class="warn">no samples yet</p></div>`;
  const s=m.summary,mo=m.monitor;

@@ -1,9 +1,19 @@
 {
-  "_doc": "Copy to /etc/halow/nodes.json with the real bearer token (mesh-v4 config/secrets.env ADMIN_TOKEN). Never commit the real file. mac = the node's HaLow (MM6108) station MAC as seen by THIS gateway — NOT the ESP32's 2.4 GHz WiFi MAC from mesh-v4 device.env; empty until first association teaches it. expected_interval_s = optional freshness override; null = learn from the node's own /api/settings (firmware silently clamps intervals — the nodewatch lesson). Schema v2, shared with the reach matrix (26) and presence ledger (30). Edited at runtime by 'halowctl node' — deploy.sh never clobbers a live copy.",
+  "_doc": "Copy to /etc/halow/nodes.json with the real bearer token (mesh-v4 config/secrets.env ADMIN_TOKEN). Never commit the real file. mac = the node's HaLow (MM6108) station MAC as seen by THIS gateway \u2014 NOT the ESP32's 2.4 GHz WiFi MAC from mesh-v4 device.env; empty until first association teaches it. expected_interval_s = optional freshness override; null = learn from the node's own /api/settings (firmware silently clamps intervals \u2014 the nodewatch lesson). Schema v2, shared with the reach matrix (26) and presence ledger (30). Edited at runtime by 'halowctl node' \u2014 deploy.sh never clobbers a live copy. expected_interval_s is what the node ACTUALLY does (intervals get clamped \u2014 ask for 60s, get 1800s), not what you asked; mark it [M] only after observed inter-arrivals confirm it. Presence ledger (30) alarms only nodes carrying both mac + expected_interval_s.",
   "nodes": [
-    { "name": "node1", "url": "https://192.168.50.103", "token": "CHANGE-ME",
-      "mac": "", "expected_interval_s": null },
-    { "name": "node2", "url": "https://192.168.51.104", "token": "CHANGE-ME",
-      "mac": "", "expected_interval_s": null }
+    {
+      "name": "node1",
+      "url": "https://192.168.50.103",
+      "token": "CHANGE-ME",
+      "mac": "",
+      "expected_interval_s": 900
+    },
+    {
+      "name": "node2",
+      "url": "https://192.168.51.104",
+      "token": "CHANGE-ME",
+      "mac": "",
+      "expected_interval_s": null
+    }
   ]
 }

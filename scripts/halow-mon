@@ -20,6 +20,9 @@ HEALTH = os.path.join(STATE_DIR, "station-health.json")
 EVENTS_LOG = os.path.join(STATE_DIR, "station-events.log")
 RUNGCOST = os.path.join(STATE_DIR, "rungcost-state.json")
 BROWNOUT = os.path.join(STATE_DIR, "brownout.jsonl")
+CHECKINS = os.path.join(STATE_DIR, "checkins.jsonl")
+PRESENCE = os.path.join(STATE_DIR, "presence.json")
+HOLD_MULT = 3   # nodewatch HOLD_MULTIPLIER: judge at 3x the node's interval
 RING_LINES = 2880  # 2 days at 1/min
 UPSTREAM = "192.168.50.1"
 DISK_LOW_MB = 512  # SD low-water; mirrored in halow_ui.py
@@ -231,6 +234,155 @@ def brownout_ledger(st, thr_hex, now):
                 atomic_write(BROWNOUT, "".join(lines[-1000:]))
         except OSError:
             pass
+
+
+def presence_step(parsed, now):
+    """Expected-interval adherence ledger (roadmap 30). Judgment lives here
+    (root, already samples each minute); receipt is the UI's /api/checkin.
+    Only nodes with mac + expected_interval_s are ON the contract; absence
+    of the field = absence of judgment (nodewatch: a wrong interval is
+    worse than none). Dead-vs-quiet split kept: overdue-associated (link
+    up, app silent) vs overdue-absent (silent at every layer). Judgment
+    withheld while our own uptime < window — after a reboot every node
+    would look overdue, and a bad answer means WE don't know."""
+    try:
+        nodes = json.load(open("/etc/halow/nodes.json")).get("nodes", [])
+    except Exception:
+        nodes = []
+    contract = [n for n in nodes if n.get("mac")
+                and n.get("expected_interval_s")]
+    try:
+        prev = json.load(open(PRESENCE))
+    except Exception:
+        prev = {"nodes": {}, "unlisted": []}
+    prev_nodes = prev.get("nodes", {})
+    uptime = float(open("/proc/uptime").read().split()[0])
+
+    # evidence sources
+    last_checkin = {}
+    try:
+        for line in open(CHECKINS):
+            try:
+                r = json.loads(line)
+                last_checkin[r["node"]] = r
+            except Exception:
+                pass
+    except OSError:
+        pass
+    frames = {e["mac"]: now - e.get("inactive_ms", 0) / 1000.0
+              for e in parsed if "inactive_ms" in e}
+    assoc = {e["mac"] for e in parsed}
+    leases = {}   # mac -> approx last renewal (expiry - duration)
+    dur = 43200
+    try:
+        import re as _re
+        d = open("/etc/dnsmasq.d/halow.conf").read()
+        m = _re.search(r"dhcp-range=[\d.]+,[\d.]+,(\d+)([hm])", d)
+        if m:
+            dur = int(m.group(1)) * (3600 if m.group(2) == "h" else 60)
+    except OSError:
+        pass
+    try:
+        for line in open("/var/lib/misc/dnsmasq.leases"):
+            p = line.split()
+            if len(p) >= 3 and p[0].isdigit():
+                leases[p[1].lower()] = int(p[0]) - dur
+    except OSError:
+        pass
+    joins = {}
+    try:
+        for line in open(EVENTS_LOG):
+            p = line.split()
+            if len(p) >= 3 and p[1] == "AP-STA-CONNECTED":
+                try:
+                    joins[p[2].lower()] = time.mktime(
+                        time.strptime(p[0][:19], "%Y-%m-%dT%H:%M:%S"))
+                except Exception:
+                    pass
+    except OSError:
+        pass
+
+    out_nodes, events = {}, []
+    for n in contract:
+        name = n["name"]
+        mac = n["mac"].lower()
+        iv = int(n["expected_interval_s"])
+        window = HOLD_MULT * iv
+        ev = {}
+        ci = last_checkin.get(name)
+        if ci:
+            ev["checkin"] = ci["t"]
+        if mac in frames:
+            ev["frames"] = int(frames[mac])
+        if mac in leases:
+            ev["lease~"] = leases[mac]
+        if mac in joins:
+            ev["join"] = int(joins[mac])
+        # best evidence: most-trusted source first
+        best_src, best_t = None, 0
+        for src in ("checkin", "frames", "lease~", "join"):
+            if src in ev and ev[src] > best_t:
+                best_src, best_t = src, ev[src]
+        associated = mac in assoc
+        if best_src is None:
+            state = "no-data"
+            age = None
+        else:
+            age = now - best_t
+            if age <= window:
+                state = "fresh"
+            elif associated:
+                state = "overdue-associated"
+            else:
+                state = "overdue-absent"
+        # reboot guard: withhold judgment until our uptime covers the window
+        pn = prev_nodes.get(name, {})
+        if uptime < window and state.startswith("overdue"):
+            state = pn.get("state", "no-data")
+        prev_state = pn.get("state")
+        missed = pn.get("missed_total", 0)
+        since = pn.get("since", now)
+        if state != prev_state:
+            since = now
+            if state.startswith("overdue") and prev_state == "fresh":
+                missed += 1
+                events.append(
+                    f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} PRESENCE-MISSED "
+                    f"{mac} node={name} window={window}s "
+                    f"last={best_src}+{int(age)}s associated="
+                    f"{'yes' if associated else 'no'}")
+            elif state == "fresh" and prev_state and \
+                    prev_state.startswith("overdue"):
+                gap = int(now - pn.get("since", now))
+                events.append(
+                    f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} "
+                    f"PRESENCE-RETURNED {mac} node={name} gap={gap}s "
+                    f"via={best_src}")
+        rec = {"mac": mac, "expected_interval_s": iv, "window_s": window,
+               "state": state, "since": since, "evidence": ev,
+               "missed_total": missed}
+        if best_src:
+            rec["last_evidence"] = {"t": best_t, "source": best_src,
+                                    "age_s": int(age)}
+        if ci:
+            rec["last_checkin"] = {"t": ci["t"],
+                                   "uptime_s": ci.get("uptime_s"),
+                                   "batt_mv": ci.get("batt_mv")}
+        out_nodes[name] = rec
+
+    # unlisted: check-ins from unknown names + associated MACs on no contract
+    contract_macs = {n["mac"].lower() for n in contract}
+    unlisted = []
+    for name, ci in last_checkin.items():
+        if not ci.get("registered"):
+            unlisted.append({"node": name, "checkin": ci["t"]})
+    for mac in assoc:
+        if mac not in contract_macs:
+            unlisted.append({"mac": mac, "seen": now})
+
+    append_events(events)
+    atomic_write(PRESENCE, json.dumps(
+        {"t": now, "nodes": out_nodes, "unlisted": unlisted}))
 
 
 def rungcost_step(parsed, now):
@@ -502,6 +654,11 @@ def main():
     except Exception as e:
         subprocess.run(["logger", "-t", "halow-mon",
                         f"rungcost step failed: {e.__class__.__name__}: {e}"])
+    try:
+        presence_step(parsed, now)
+    except Exception as e:
+        subprocess.run(["logger", "-t", "halow-mon",
+                        f"presence step failed: {e.__class__.__name__}: {e}"])
 
     # --- sample ---
     thr = sh("vcgencmd get_throttled")

@@ -36,8 +36,13 @@ PY
 SESSION_SECRET=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
 # Bearer token for the config API = the mesh-v4 ADMIN_TOKEN; only its hash ships
 API_TOKEN_HASH=$(printf '%s' "$ADMIN_TOKEN" | sha256sum | cut -d" " -f1)
-printf 'AUTH_SALT=%s\nAUTH_HASH=%s\nAUTH_ITER=100000\nSESSION_SECRET=%s\nAPI_TOKEN_HASH=%s\n' \
-  "$SALT" "$HASH" "$SESSION_SECRET" "$API_TOKEN_HASH" > "$T/ui.conf"
+# Optional check-in token (repo-root secrets.env: CHECKIN_TOKEN=...) — a
+# SEPARATE credential nodes use to prove liveness without holding the admin
+# bearer. Hash only ships; empty = /api/checkin answers 503. Never echoed.
+CHECKIN_TOKEN_HASH=$(printf '%s' "${CHECKIN_TOKEN:-}" | sha256sum | cut -d" " -f1)
+[ -n "${CHECKIN_TOKEN:-}" ] || CHECKIN_TOKEN_HASH=""
+printf 'AUTH_SALT=%s\nAUTH_HASH=%s\nAUTH_ITER=100000\nSESSION_SECRET=%s\nAPI_TOKEN_HASH=%s\nCHECKIN_TOKEN_HASH=%s\n' \
+  "$SALT" "$HASH" "$SESSION_SECRET" "$API_TOKEN_HASH" "$CHECKIN_TOKEN_HASH" > "$T/ui.conf"
 sed -e "s|CHANGE-ME|${ADMIN_TOKEN}|g" "$REPO/config/nodes.json.example" > "$T/nodes.json"
 scp -q "$T/halow.env" "$T/ui.conf" "$T/nodes.json" "$PI:/tmp/halow-deploy/" 2>/dev/null || {
   ssh "$PI" 'mkdir -p /tmp/halow-deploy && chmod 700 /tmp/halow-deploy'

@@ -388,7 +388,26 @@ nothing on the v1 rejected list); verifier corrections are folded in.
     explicitly NOT the rejected store-and-forward relay — no onward
     queueing. LAN-testable with curl today; full value gated on the node
     TX datapath. [medium/high]
-30. **Station presence ledger + check-in contract** — per-node expected
+30. **Station presence ledger + check-in contract** — MACHINERY DONE
+    2026-08-05, CLOSING THE ROADMAP (POST /api/checkin: push receiver
+    with a SEPARATE token — nodes prove liveness without the admin
+    bearer — 2KB cap, field whitelist so a node bug can't push junk,
+    receipt-time authoritative, unregistered names still recorded.
+    Adherence ledger in halow-mon: best-evidence per node
+    checkin>frames>lease~>join, 3x-interval window, dead-vs-quiet split
+    overdue-associated vs overdue-absent, reboot guard (withhold while
+    our uptime < window), transitions deduped into PRESENCE-MISSED/
+    RETURNED, atomic presence.json. GET /api/presence with battery
+    trend + the machine-readable contract; Overview presence card.
+    Drilled [M]: round-trip receipt-confirmed, admin superset works,
+    413/401/503 boundaries, junk-field dropped, token in no file/journal
+    (hash only, survives redeploy), state machine fresh->overdue-absent
+    with EXACTLY one MISSED across repeated passes then RETURNED
+    gap+via, off-contract nodes never judged. Only nodes with mac +
+    expected_interval_s are on the contract. Cadence-honesty + real
+    evidence-source [M] runs need a checking-in station. Auth bug found
+    + fixed: the fallback double-counted failures and throttled honest
+    clients.) — per-node expected
     interval (nodes.json), adherence computed over recorded
     joins/leases/stations.jsonl with dead-vs-quiet discipline, plus
     authenticated `POST /api/checkin` (push-on-schedule is the proven
