@@ -5,6 +5,7 @@
 #   halowctl check-compat [profile=N|channel=N width=M ssid=S]  pinned-set verdicts (read-only JSON)
 #   halowctl set-profile NAME [confirm=1]  switch profile (guarded: refuses off-pinned-set retunes while stations/reservations exist)
 #   halowctl set KEY=VAL ... [confirm=1]   override channel=N width=M ssid=S (persisted; same guard)
+#     session knobs: inactivity=S bss_max_idle=0-2 max_idle=TU dtim=1-255 (empty clears)
 #   halowctl gen               regenerate hostapd conf from env+profile
 #   halowctl stations          associated STA dump
 #   halowctl join-log [mac|--all|--selftest]  association forensics (read-only)
@@ -222,7 +223,14 @@ logger_syslog_level=2
 logger_stdout=-1
 logger_stdout_level=1
 EOF
-  echo "generated $CONF: ${HALOW_SSID} ch=$CH op_class=$OP width=${WIDTH}MHz"
+  # Battery-ready session knobs (roadmap 28): append conditionally, empty
+  # = hostapd default. Units per hostapd config_file.c; max_idle is
+  # 1000-TU units, NOT seconds.
+  [ -n "${HALOW_AP_MAX_INACTIVITY:-}" ] && echo "ap_max_inactivity=${HALOW_AP_MAX_INACTIVITY}" >> "$CONF"
+  [ -n "${HALOW_BSS_MAX_IDLE:-}" ]      && echo "bss_max_idle=${HALOW_BSS_MAX_IDLE}" >> "$CONF"
+  [ -n "${HALOW_MAX_IDLE_TU:-}" ]       && echo "max_acceptable_idle_period=${HALOW_MAX_IDLE_TU}" >> "$CONF"
+  [ -n "${HALOW_DTIM_PERIOD:-}" ]       && echo "dtim_period=${HALOW_DTIM_PERIOD}" >> "$CONF"
+  echo "generated $CONF: ${HALOW_SSID} ch=$CH op_class=$OP width=${WIDTH}MHz idle=${HALOW_AP_MAX_INACTIVITY:-300} dtim=${HALOW_DTIM_PERIOD:-2}"
 }
 
 case "${1:-status}" in
@@ -269,15 +277,26 @@ PY
         *) pairs+=("$kv") ;;
       esac
     done
-    [ ${#pairs[@]} -gt 0 ] || { echo "usage: halowctl set channel=N|width=M|ssid=S [confirm=1]"; exit 1; }
+    [ ${#pairs[@]} -gt 0 ] || { echo "usage: halowctl set channel=N|width=M|ssid=S|inactivity=S|bss_max_idle=0-2|max_idle=TU|dtim=1-255 [confirm=1]"; exit 1; }
+    # sed only rewrites keys that already exist; ensure the session knobs
+    # are present on env files that predate this feature
+    ensure_key() { sudo grep -q "^$1=" "$ENV" || echo "$1=" | sudo tee -a "$ENV" >/dev/null; }
+    # validate BEFORE any mutation (empty = clear to hostapd default)
     for kv in "${pairs[@]}"; do
-      case "${kv%%=*}" in
+      k=${kv%%=*}; v=${kv#*=}
+      case "$k" in
         channel|width|ssid) ;;
-        *) echo "unknown key ${kv%%=*} (channel|width|ssid)"; exit 1;;
+        inactivity)   [ -z "$v" ] || { [ "$v" -ge 60 ] && [ "$v" -le 86400 ]; } 2>/dev/null || { echo "inactivity: seconds 60-86400 (or empty)"; exit 1; };;
+        bss_max_idle) [ -z "$v" ] || case "$v" in 0|1|2) ;; *) echo "bss_max_idle: 0|1|2 (or empty)"; exit 1;; esac;;
+        max_idle)     [ -z "$v" ] || { [ "$v" -ge 1 ] && [ "$v" -le 65535 ]; } 2>/dev/null || { echo "max_idle: 1000-TU units 1-65535 (or empty)"; exit 1; };;
+        dtim)         [ -z "$v" ] || { [ "$v" -ge 1 ] && [ "$v" -le 255 ]; } 2>/dev/null || { echo "dtim: 1-255 (or empty)"; exit 1; };;
+        *) echo "unknown key $k (channel|width|ssid|inactivity|bss_max_idle|max_idle|dtim)"; exit 1;;
       esac
     done
-    if [ "$confirm" != 1 ]; then
-      compat_check 1 "${pairs[@]}" || exit 4
+    # RF compat guard only applies to channel/width/ssid changes
+    rf_pairs=(); for kv in "${pairs[@]}"; do case "${kv%%=*}" in channel|width|ssid) rf_pairs+=("$kv");; esac; done
+    if [ "$confirm" != 1 ] && [ ${#rf_pairs[@]} -gt 0 ]; then
+      compat_check 1 "${rf_pairs[@]}" || exit 4
     fi
     for kv in "${pairs[@]}"; do
       k=${kv%%=*}; v=${kv#*=}
@@ -285,6 +304,10 @@ PY
         channel) sudo sed -i "s/^HALOW_CHANNEL=.*/HALOW_CHANNEL=$v/" "$ENV";;
         width)   sudo sed -i "s/^HALOW_WIDTH=.*/HALOW_WIDTH=$v/" "$ENV";;
         ssid)    sudo sed -i "s/^HALOW_SSID=.*/HALOW_SSID=$v/" "$ENV";;
+        inactivity)   ensure_key HALOW_AP_MAX_INACTIVITY; sudo sed -i "s/^HALOW_AP_MAX_INACTIVITY=.*/HALOW_AP_MAX_INACTIVITY=$v/" "$ENV";;
+        bss_max_idle) ensure_key HALOW_BSS_MAX_IDLE;      sudo sed -i "s/^HALOW_BSS_MAX_IDLE=.*/HALOW_BSS_MAX_IDLE=$v/" "$ENV";;
+        max_idle)     ensure_key HALOW_MAX_IDLE_TU;       sudo sed -i "s/^HALOW_MAX_IDLE_TU=.*/HALOW_MAX_IDLE_TU=$v/" "$ENV";;
+        dtim)         ensure_key HALOW_DTIM_PERIOD;       sudo sed -i "s/^HALOW_DTIM_PERIOD=.*/HALOW_DTIM_PERIOD=$v/" "$ENV";;
       esac
     done
     sudo "$0" gen && sudo systemctl restart halow-ap

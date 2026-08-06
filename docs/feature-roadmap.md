@@ -343,7 +343,23 @@ nothing on the v1 rejected list); verifier corrections are folded in.
 
 ### Tier 4 — product-path groundwork
 
-28. **Battery-ready AP session knobs** — vendored hostapd supports
+28. **Battery-ready AP session knobs** — MACHINERY DONE 2026-08-05
+    (halowctl set inactivity=/bss_max_idle=/max_idle=/dtim= — validated
+    before mutation, empty clears, ensure_key + deploy migration for old
+    env files; gen appends 4 conf lines. PROVEN [M]: the vendored
+    hostapd_s1g binary ACCEPTS all four keys — AP active, zero parse
+    errors — which was [C] from config_file.c until run. Reason capture
+    in halow-sta-events: bounded 3-min journal query on disconnect,
+    pattern-extract only (never raw text), <3s; connect path untouched
+    (0.03s). Per-STA idle sampling via hostapd_cli sta into
+    stations.jsonl; /api/halow/link idle block with the 3-source limit
+    resolution (sta-negotiated 5273TU->5400s / ap-config / ap-default
+    300) verified live. Rejections leave env byte-identical; secrets 0;
+    reason-pattern fixtures extract both hostapd formats incl. the
+    'disassocation' misspelling, benign lines nothing. The kick/poll/
+    long-idle-grant [M] runs need a joined station with PS enabled —
+    node-side, blocked on battery-only bench.) — vendored hostapd
+    supports
     ap_max_inactivity/bss_max_idle/max_acceptable_idle_period with
     per-STA S1G long-idle; halowctl gen writes none (300 s default).
     Not urgent today (hostapd polls before deauth; nodes pin PS off) —

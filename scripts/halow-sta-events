@@ -3,5 +3,23 @@
 # Records station lifecycle with timestamps — the join history the UI,
 # the API, and the eventual ladder metric all read.
 LOG=/var/lib/halow/station-events.log
-printf '%s %s %s\n' "$(date -Is)" "$2" "${3:-}" >> "$LOG"
-logger -t halow-sta "$2 ${3:-}"
+REASON=""
+if [ "$2" = AP-STA-DISCONNECTED ] && [ -n "${3:-}" ]; then
+  # the ctrl event fires before hostapd flushes its INFO logger line
+  # (ap_sta_set_authorized precedes the disassoc logger), so let journald
+  # write, then pattern-extract the reason — NEVER append raw journal text
+  # (the SAE PSK has leaked twice via "harmless" echoes; a pattern-extract
+  # cannot carry arbitrary text). AP inactivity kicks are visible at stock
+  # log levels; STA-originated reason_code=N lines need the #16 -d raise.
+  sleep 1
+  REASON=$(journalctl -u halow-ap --since "-3 min" --no-pager -q 2>/dev/null \
+    | grep -iF "$3" \
+    | grep -oE '(deauthenticated|disassociated) due to [a-zA-Z ()/]+|(deauthentication|disassocation): STA=[0-9a-f:]+ reason_code=[0-9]+' \
+    | tail -1)
+fi
+if [ -n "$REASON" ]; then
+  printf '%s %s %s reason="%s"\n' "$(date -Is)" "$2" "${3:-}" "$REASON" >> "$LOG"
+else
+  printf '%s %s %s\n' "$(date -Is)" "$2" "${3:-}" >> "$LOG"
+fi
+logger -t halow-sta "$2 ${3:-}${REASON:+ reason=$REASON}"

@@ -54,6 +54,11 @@ sudo usermod -aG video halow-ui 2>/dev/null || true
 # Group halow-ui: the console reads SSID/profile/mode from this file.
 [ -f /etc/halow/halow.env ] || sudo install -m640 -o root -g halow-ui /tmp/halow-deploy/halow.env /etc/halow/
 sudo chgrp halow-ui /etc/halow/halow.env && sudo chmod 640 /etc/halow/halow.env
+# migrate new env keys onto deployments whose halow.env predates them, so
+# halowctl diff (key-set comparison) stays quiet and set can sed them
+for K in HALOW_ROLE HALOW_BRIDGE_UPLINK HALOW_BRIDGE_ETH HALOW_WATCH_INTERVAL HALOW_WATCH_DIAG_EVERY HALOW_KERNEL_POLICY HALOW_REPO_DIR HALOW_AP_MAX_INACTIVITY HALOW_BSS_MAX_IDLE HALOW_MAX_IDLE_TU HALOW_DTIM_PERIOD; do
+  sudo grep -q "^$K=" /etc/halow/halow.env || echo "$K=" | sudo tee -a /etc/halow/halow.env >/dev/null
+done
 # ui.conf is read by the unprivileged UI user
 sudo install -m640 -o root -g halow-ui /tmp/halow-deploy/ui.conf /etc/halow/
 # nodes.json: NEVER clobber a live copy — runtime-adopted nodes (halowctl

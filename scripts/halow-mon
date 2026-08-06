@@ -558,6 +558,32 @@ def main():
     # TRANSPORT_HALOW metric (rate and delivery, never datasheet numbers)
     if parsed:
         stations_log = os.path.join(STATE_DIR, "stations.jsonl")
+        # per-STA idle/sleep introspection from hostapd (roadmap 28): the
+        # receiver-side "how close to being kicked" gauge. Capped at 16
+        # stations/cycle; absent output (hostapd down) is skipped, never
+        # invented. Never append raw ctrl-socket text — only 5 named fields.
+        for e in parsed[:16]:
+            info = sh("hostapd_cli_s1g -p /var/run/hostapd_s1g -i halow0 "
+                      f"sta {e['mac']}")
+            if not info:
+                continue
+            for line in info.splitlines():
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                try:
+                    if k == "inactive_msec":
+                        e["inactive_ms"] = int(v)
+                    elif k == "listen_interval":
+                        e["listen_int"] = int(v)
+                    elif k == "max_idle_period":
+                        e["max_idle_tu"] = int(v)
+                    elif k == "timeout_next":
+                        e["timeout_next"] = v.strip()[:32]
+                    elif k == "flags":
+                        e["pending_poll"] = "[PENDING_POLL" in v
+                except ValueError:
+                    pass
         with open(stations_log, "a") as f:
             for e in parsed:
                 f.write(json.dumps({"t": now, **e}) + "\n")

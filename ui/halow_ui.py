@@ -351,7 +351,15 @@ def api_halow_mode():
 @app.post("/api/halow/set")
 @authed
 def api_halow_set():
+    import re as _re
     args = ["set"]
+    # session knobs (roadmap 28) — halowctl validates; numeric or empty
+    for k in ("inactivity", "bss_max_idle", "max_idle", "dtim"):
+        v = request.form.get(k)
+        if v is not None and v != "" and not v.isdigit():
+            return jsonify({"error": f"{k} must be numeric or empty"}), 400
+        if v is not None:
+            args.append(f"{k}={v}")
     ch = request.form.get("channel")
     w = request.form.get("width")
     ssid = request.form.get("ssid")
@@ -1153,6 +1161,29 @@ def api_halow_link(mac=None):
             if tx_pkts else None,
             "retry_pct": round(100 * retries / tx_pkts, 2) if tx_pkts else None,
         }
+        # idle/kick gauge (roadmap 28): receiver-side "how close to being
+        # deauthed for inactivity, and what idle period was granted".
+        if "inactive_ms" in last:
+            import math as _math
+            tu = last.get("max_idle_tu")
+            env = load_kv(ENV_CONF)
+            if tu:
+                limit_s = _math.ceil(tu * 1024 / 1000)  # sta_info.c:594
+                src = "sta-negotiated"
+            elif env.get("HALOW_AP_MAX_INACTIVITY"):
+                limit_s = int(env["HALOW_AP_MAX_INACTIVITY"])
+                src = "ap-config"
+            else:
+                limit_s = 300
+                src = "ap-default"
+            inact = last["inactive_ms"] / 1000.0
+            out[m]["idle"] = {
+                "inactive_s": round(inact, 1), "limit_s": limit_s,
+                "limit_source": src,
+                "used_pct": round(100 * inact / limit_s, 1) if limit_s else None,
+                "listen_interval": last.get("listen_int"),
+                "timeout_next": last.get("timeout_next"),
+                "pending_poll": last.get("pending_poll")}
     # health ladder merge (station-health.json, halow-mon roadmap 18):
     # absent file -> health: null, shape otherwise unchanged. Health-only
     # MACs (e.g. reserved never-seen nodes) appear with null telemetry so
